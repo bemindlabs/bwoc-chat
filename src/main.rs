@@ -395,6 +395,31 @@ struct Pending {
     detail: String,
 }
 
+/// One row in the activity panel: a compact one-line `summary` shown as the
+/// (optionally collapsible) header, plus the full untruncated `body` rendered
+/// as markdown when expanded. `body` is empty when the summary already shows
+/// everything, in which case the row renders flat with no collapse arrow.
+struct ActivityItem {
+    summary: String,
+    body: String,
+}
+
+impl ActivityItem {
+    /// Build from a `summary` line and the `full` untruncated content. A body
+    /// is kept only when `full` adds something the summary can't show on one
+    /// line (it's multi-line, or the summary truncated it).
+    fn new(summary: String, full: String) -> Self {
+        let collapses = full.contains('\n') || full.chars().count() > 80;
+        let body = if collapses { full } else { String::new() };
+        ActivityItem { summary, body }
+    }
+
+    /// A row that is only ever a one-liner (e.g. a permission decision).
+    fn line(summary: String) -> Self {
+        ActivityItem { summary, body: String::new() }
+    }
+}
+
 /// One agent = one `bwoc-harness --chat` subprocess plus the live UI state the
 /// window renders for it. Its [`Drop`] reaps the child so no harness is orphaned.
 struct AgentSession {
@@ -405,7 +430,7 @@ struct AgentSession {
     /// Tool names from this agent's `Ready` event (for `/tools`).
     tools: Vec<String>,
     /// Per-agent tool-call / result log shown in the activity panel.
-    activity: Vec<String>,
+    activity: Vec<ActivityItem>,
     busy: bool,
     alive: bool,
     pending: Option<Pending>,
@@ -617,17 +642,19 @@ impl ChatApp {
                 }
             }
             ChatEvent::ToolCall { name, args, .. } => {
+                let summary = format!("» {name} {}", truncate(&args, 80));
                 self.sessions[idx]
                     .activity
-                    .push(format!("» {name} {}", truncate(&args, 80)));
+                    .push(ActivityItem::new(summary, args));
             }
             ChatEvent::ToolResult {
                 name, ok, output, ..
             } => {
                 let mark = if ok { "[ok]" } else { "[err]" };
+                let summary = format!("{mark} {name}: {}", truncate(&output, 80));
                 self.sessions[idx]
                     .activity
-                    .push(format!("{mark} {name}: {}", truncate(&output, 80)));
+                    .push(ActivityItem::new(summary, output));
             }
             ChatEvent::PermissionRequest { id, tool, detail } => {
                 self.sessions[idx].pending = Some(Pending { id, tool, detail });
@@ -932,6 +959,9 @@ impl eframe::App for ChatApp {
                     .show(ui, |ui| {
                         let team = self.sessions.len() > 1;
                         let mut any = false;
+                        // Unique salt per row so identical summaries don't share
+                        // collapsing state.
+                        let mut row = 0usize;
                         for s in &self.sessions {
                             if s.activity.is_empty() {
                                 continue;
@@ -942,14 +972,26 @@ impl eframe::App for ChatApp {
                                     egui::RichText::new(short(&s.id)).color(s.color).strong(),
                                 );
                             }
-                            // Tool args/output may carry markdown (code fences,
-                            // tables, links); render each line as CommonMark.
-                            for line in &s.activity {
-                                egui_commonmark::CommonMarkViewer::new().show(
-                                    ui,
-                                    &mut md_cache,
-                                    line,
-                                );
+                            for item in &s.activity {
+                                row += 1;
+                                if item.body.is_empty() {
+                                    // Nothing to expand — render the line flat.
+                                    ui.label(&item.summary);
+                                } else {
+                                    // Collapsed by default to keep the panel
+                                    // compact; the full body (which may carry
+                                    // code fences, tables, links) renders as
+                                    // CommonMark when expanded.
+                                    egui::CollapsingHeader::new(&item.summary)
+                                        .id_salt(row)
+                                        .show(ui, |ui| {
+                                            egui_commonmark::CommonMarkViewer::new().show(
+                                                ui,
+                                                &mut md_cache,
+                                                &item.body,
+                                            );
+                                        });
+                                }
                             }
                             if team {
                                 ui.add_space(4.0);
@@ -1129,11 +1171,11 @@ impl eframe::App for ChatApp {
         }
         for (i, allow) in perms {
             if let Some(p) = self.sessions[i].pending.take() {
-                self.sessions[i].activity.push(format!(
+                self.sessions[i].activity.push(ActivityItem::line(format!(
                     "{} {}",
                     if allow { "[allowed]" } else { "[denied]" },
                     p.tool
-                ));
+                )));
                 self.sessions[i].write(&ChatInput::Permission { id: p.id, allow });
             }
         }
