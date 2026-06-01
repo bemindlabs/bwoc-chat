@@ -50,7 +50,7 @@ const PALETTE: &[(u8, u8, u8)] = &[
 const COMMANDS: &[(&str, &str)] = &[
     ("/help", "list commands"),
     ("/tools", "list each agent's available tools"),
-    ("/mode", "permission mode: default | accept-edits | bypass"),
+    ("/mode", "permission mode: default | accept-edits | bypass | plan"),
     ("/clear", "wipe the conversation + tool activity"),
     ("/forget", "clear every agent's memory of this conversation"),
     ("/quit", "close the window"),
@@ -265,11 +265,16 @@ fn resolve_workspace_agent(
         .find(|a| a.id == lookup)
         .ok_or_else(|| format!("no agent named '{name}' in {}", workspace.display()))?;
 
-    // Only the harness-driven backends produce a chat_proto stream.
-    if !matches!(entry.backend.as_str(), "ollama" | "openai-compatible") {
+    // Backends the harness can render as a chat_proto stream: the OpenAI-compat
+    // HTTP path and the native Anthropic provider. Other vendor CLIs (codex /
+    // kimi / agy) have no harness stream — point the user at `bwoc spawn`.
+    if !matches!(
+        entry.backend.as_str(),
+        "ollama" | "openai-compatible" | "claude" | "anthropic"
+    ) {
         return Err(format!(
-            "agent '{}' uses the '{}' backend — bwoc-chat only renders the harness chat \
-             stream for ollama / openai-compatible. Use `bwoc spawn` for vendor CLIs.",
+            "agent '{}' uses the '{}' backend — bwoc-chat renders the harness chat stream for \
+             ollama / openai-compatible / claude. Use `bwoc spawn` for other vendor CLIs.",
             entry.id, entry.backend
         ));
     }
@@ -423,6 +428,11 @@ impl AgentSession {
             .arg("--unrestricted")
             .arg("--workdir")
             .arg(&cfg.agent_path)
+            // Select the provider: claude → Anthropic Messages API, otherwise
+            // the OpenAI-compatible HTTP path. The harness substitutes the
+            // Anthropic endpoint for a claude agent that left the default.
+            .arg("--backend")
+            .arg(&cfg.backend)
             .arg("--model")
             .arg(&cfg.model)
             .arg("--endpoint")
@@ -633,6 +643,13 @@ impl ChatApp {
                     });
                 }
             }
+            ChatEvent::Compacted { removed } => {
+                self.convo.push(Msg {
+                    who: Who::System,
+                    agent: idx,
+                    text: format!("context compacted — folded {removed} earlier messages"),
+                });
+            }
             ChatEvent::TurnEnd {
                 prompt_tokens,
                 completion_tokens,
@@ -809,7 +826,7 @@ impl ChatApp {
                     sys(
                         self,
                         format!(
-                            "permission mode: {} — set with /mode default | accept-edits | bypass",
+                            "permission mode: {} — set with /mode default | accept-edits | bypass | plan",
                             self.mode
                         ),
                     );
