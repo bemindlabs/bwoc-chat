@@ -33,6 +33,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/help", "list commands"),
     ("/tools", "list the agent's available tools"),
     ("/clear", "wipe the conversation + tool activity"),
+    ("/forget", "clear the agent's memory of this conversation"),
     ("/quit", "close the window"),
 ];
 
@@ -405,6 +406,15 @@ impl ChatApp {
                 self.status = format!("{agent} · {model} · {backend} · ready");
                 self.tools = tools;
             }
+            ChatEvent::Restored { role, text } => {
+                // A turn replayed from a persisted session — show it in history.
+                let who = if role == "user" {
+                    Who::User
+                } else {
+                    Who::Agent
+                };
+                self.convo.push((who, text));
+            }
             ChatEvent::Token { text } => {
                 // Append streamed tokens onto the in-progress agent message.
                 match self.convo.last_mut() {
@@ -489,6 +499,17 @@ impl ChatApp {
                 self.convo.clear();
                 self.activity.clear();
                 sys(self, "conversation cleared.".to_string());
+            }
+            "forget" => {
+                // Tell the harness to drop its memory + the on-disk session,
+                // and clear our display too.
+                self.write_input(&ChatInput::Forget);
+                self.convo.clear();
+                self.activity.clear();
+                sys(
+                    self,
+                    "memory cleared — the agent will start fresh.".to_string(),
+                );
             }
             "quit" | "exit" => {
                 self.write_input(&ChatInput::Quit);
