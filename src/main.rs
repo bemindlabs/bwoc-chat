@@ -84,9 +84,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with_title(title.clone()),
         ..Default::default()
     };
-    eframe::run_native(&title, options, Box::new(|_cc| Ok(Box::new(app))))
-        .map_err(|e| format!("eframe: {e}"))?;
+    eframe::run_native(
+        &title,
+        options,
+        Box::new(|cc| {
+            install_fonts(&cc.egui_ctx);
+            Ok(Box::new(app))
+        }),
+    )
+    .map_err(|e| format!("eframe: {e}"))?;
     Ok(())
+}
+
+/// Install a Thai/Unicode-capable fallback font so non-Latin text (e.g. Thai)
+/// renders instead of tofu boxes — egui's built-in fonts are Latin-centric. We
+/// append a broad system font as a per-glyph fallback (egui falls through the
+/// family list glyph-by-glyph). Best-effort: if no candidate is found, egui
+/// keeps its default and Latin still renders.
+fn install_fonts(ctx: &egui::Context) {
+    const CANDIDATES: &[&str] = &[
+        "/System/Library/Fonts/Supplemental/Ayuthaya.ttf", // macOS — Thai + Latin, small
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf", // macOS — very broad
+        "/usr/share/fonts/truetype/noto/NotoSansThai-Regular.ttf", // Linux
+        "/usr/share/fonts/noto/NotoSansThai-Regular.ttf",
+    ];
+    let Some(bytes) = CANDIDATES.iter().find_map(|p| std::fs::read(p).ok()) else {
+        return;
+    };
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "unicode_fallback".to_owned(),
+        egui::FontData::from_owned(bytes),
+    );
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        fonts
+            .families
+            .entry(family)
+            .or_default()
+            .push("unicode_fallback".to_owned());
+    }
+    ctx.set_fonts(fonts);
 }
 
 // ---------------------------------------------------------------------------
@@ -262,12 +299,12 @@ impl ChatApp {
             }
             ChatEvent::ToolCall { name, args, .. } => {
                 self.activity
-                    .push(format!("🔧 {name} {}", truncate(&args, 80)));
+                    .push(format!("» {name} {}", truncate(&args, 80)));
             }
             ChatEvent::ToolResult {
                 name, ok, output, ..
             } => {
-                let mark = if ok { "✓" } else { "✗" };
+                let mark = if ok { "[ok]" } else { "[err]" };
                 self.activity
                     .push(format!("{mark} {name}: {}", truncate(&output, 80)));
             }
@@ -280,7 +317,7 @@ impl ChatApp {
             } => {
                 self.busy = false;
                 self.status = format!(
-                    "{} · ready · tokens {}↑ {}↓",
+                    "{} · ready · tokens {} in / {} out",
                     self.agent_id, prompt_tokens, completion_tokens
                 );
             }
@@ -310,7 +347,7 @@ impl ChatApp {
         if let Some(p) = self.pending.take() {
             self.activity.push(format!(
                 "{} {}",
-                if allow { "✓ allowed" } else { "✗ denied" },
+                if allow { "[allowed]" } else { "[denied]" },
                 p.tool
             ));
             self.write_input(&ChatInput::Permission { id: p.id, allow });
@@ -347,7 +384,7 @@ impl eframe::App for ChatApp {
 
         egui::TopBottomPanel::top("status").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.strong("🜂 bwoc-chat");
+                ui.strong("bwoc-chat");
                 ui.separator();
                 ui.label(&self.status);
                 if self.busy {
@@ -378,7 +415,7 @@ impl eframe::App for ChatApp {
             if let Some(p) = &self.pending {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(
-                        egui::RichText::new(format!("⚠ permission: {} ", p.tool))
+                        egui::RichText::new(format!("permission: {} ", p.tool))
                             .color(egui::Color32::from_rgb(0xE0, 0xA0, 0x30))
                             .strong(),
                     );
