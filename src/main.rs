@@ -27,6 +27,14 @@ use eframe::egui;
 /// `baseUrl`. Mirrors the harness's own default.
 const DEFAULT_ENDPOINT: &str = "http://localhost:11434/v1";
 
+/// Client-side slash commands: `(name, description)`. Surfaced as a filtered
+/// list when the input starts with `/`; dispatched by [`ChatApp::run_command`].
+const COMMANDS: &[(&str, &str)] = &[
+    ("/help", "list commands"),
+    ("/clear", "wipe the conversation + tool activity"),
+    ("/quit", "close the window"),
+];
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = match Config::from_args(std::env::args().skip(1).collect()) {
         Ok(c) => c,
@@ -411,6 +419,7 @@ impl eframe::App for ChatApp {
 
         let mut do_send = false;
         let mut perm: Option<bool> = None;
+        let mut run_cmd: Option<&'static str> = None;
 
         egui::TopBottomPanel::top("status").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -458,6 +467,30 @@ impl eframe::App for ChatApp {
                     }
                 });
             } else {
+                // Slash-command list: when the input starts with `/`, show the
+                // matching commands above the input. Click a row to run it.
+                if self.input.starts_with('/') {
+                    let typed = &self.input[1..];
+                    let matches: Vec<(&'static str, &'static str)> = COMMANDS
+                        .iter()
+                        .copied()
+                        .filter(|(name, _)| name[1..].starts_with(typed))
+                        .collect();
+                    if matches.is_empty() {
+                        ui.weak("no matching command — /help");
+                    }
+                    for (name, desc) in matches {
+                        let label = egui::RichText::new(format!("{name}  —  {desc}"));
+                        if ui
+                            .add(egui::Button::new(label).frame(false))
+                            .on_hover_text("click to run")
+                            .clicked()
+                        {
+                            run_cmd = Some(name);
+                        }
+                    }
+                    ui.separator();
+                }
                 ui.horizontal(|ui| {
                     let hint = if self.alive {
                         "message…  (/help for commands)"
@@ -535,7 +568,11 @@ impl eframe::App for ChatApp {
         });
         self.md_cache = md_cache;
 
-        if do_send {
+        // A clicked command from the slash list runs immediately.
+        if let Some(name) = run_cmd {
+            self.input.clear();
+            self.run_command(name.trim_start_matches('/'), ctx);
+        } else if do_send {
             // A leading `/` is a client-side command, not a message to the agent.
             let text = self.input.trim().to_string();
             if let Some(cmd) = text.strip_prefix('/') {
