@@ -31,6 +31,7 @@ const DEFAULT_ENDPOINT: &str = "http://localhost:11434/v1";
 /// list when the input starts with `/`; dispatched by [`ChatApp::run_command`].
 const COMMANDS: &[(&str, &str)] = &[
     ("/help", "list commands"),
+    ("/tools", "list the agent's available tools"),
     ("/clear", "wipe the conversation + tool activity"),
     ("/quit", "close the window"),
 ];
@@ -254,6 +255,8 @@ struct ChatApp {
     pending: Option<Pending>,
     busy: bool,
     alive: bool,
+    /// Tool names the agent has, from the `Ready` event (for `/tools`).
+    tools: Vec<String>,
     stdin: ChildStdin,
     rx: Receiver<ChatEvent>,
     child: Child,
@@ -279,6 +282,7 @@ impl ChatApp {
             pending: None,
             busy: false,
             alive: true,
+            tools: Vec::new(),
             stdin,
             rx,
             child,
@@ -292,8 +296,10 @@ impl ChatApp {
                 agent,
                 model,
                 backend,
+                tools,
             } => {
                 self.status = format!("{agent} · {model} · {backend} · ready");
+                self.tools = tools;
             }
             ChatEvent::Token { text } => {
                 // Append streamed tokens onto the in-progress agent message.
@@ -367,6 +373,14 @@ impl ChatApp {
                 self,
                 "commands: /help · /clear (wipe view) · /quit (close)".to_string(),
             ),
+            "tools" => {
+                let msg = if self.tools.is_empty() {
+                    "no tools reported (older harness, or none registered).".to_string()
+                } else {
+                    format!("{} tools: {}", self.tools.len(), self.tools.join(", "))
+                };
+                sys(self, msg);
+            }
             "clear" => {
                 self.convo.clear();
                 self.activity.clear();
