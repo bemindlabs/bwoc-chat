@@ -916,6 +916,11 @@ impl eframe::App for ChatApp {
             });
         });
 
+        // The markdown render cache is borrowed out of `self` so both the
+        // activity panel and the transcript below can render CommonMark while
+        // still iterating `&self.sessions` / `&self.convo`.
+        let mut md_cache = std::mem::take(&mut self.md_cache);
+
         // ── Activity panel: tool calls/results, grouped by agent ─────────────
         egui::SidePanel::right("activity")
             .default_width(260.0)
@@ -937,8 +942,14 @@ impl eframe::App for ChatApp {
                                     egui::RichText::new(short(&s.id)).color(s.color).strong(),
                                 );
                             }
+                            // Tool args/output may carry markdown (code fences,
+                            // tables, links); render each line as CommonMark.
                             for line in &s.activity {
-                                ui.label(line);
+                                egui_commonmark::CommonMarkViewer::new().show(
+                                    ui,
+                                    &mut md_cache,
+                                    line,
+                                );
                             }
                             if team {
                                 ui.add_space(4.0);
@@ -1054,7 +1065,6 @@ impl eframe::App for ChatApp {
         });
 
         // ── Central: shared transcript ───────────────────────────────────────
-        let mut md_cache = std::mem::take(&mut self.md_cache);
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
