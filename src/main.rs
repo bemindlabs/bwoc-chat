@@ -416,6 +416,10 @@ impl AgentSession {
         let harness = bwoc_core::exec::binary_or_name("bwoc-harness");
         let mut child = Command::new(&harness)
             .arg("--chat")
+            // Lift the workdir sandbox: a desktop chat agent reaches real files
+            // anywhere on the machine. The safety gate is the per-action ask
+            // prompt (Allow/Deny), not path confinement.
+            .arg("--unrestricted")
             .arg("--workdir")
             .arg(&cfg.agent_path)
             .arg("--model")
