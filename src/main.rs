@@ -41,7 +41,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(c) => c,
         Err(e) => {
             eprintln!(
-                "bwoc-chat: {e}\n\nusage: bwoc-chat <agent> [--workspace <dir>] [--model <m>] [--endpoint <url>]"
+                "bwoc-chat: {e}\n\n\
+                 usage: bwoc-chat [<agent>] [--here | --path <dir>] [--workspace <dir>] \
+                 [--model <m>] [--endpoint <url>]\n\
+                 \x20 no agent      → personal assistant at ~/.bwoc/personal (created on first use)\n\
+                 \x20 --here / .    → the current directory, no workspace\n\
+                 \x20 --path <dir>  → that directory directly\n\
+                 \x20 <agent>       → a named agent from the workspace registry"
             );
             std::process::exit(2);
         }
@@ -153,12 +159,16 @@ impl Config {
         let mut workspace: Option<PathBuf> = None;
         let mut model_override: Option<String> = None;
         let mut endpoint_override: Option<String> = None;
+        let mut path_override: Option<PathBuf> = None;
+        let mut here = false;
         let mut it = args.into_iter();
         while let Some(a) = it.next() {
             match a.as_str() {
                 "--workspace" => workspace = it.next().map(PathBuf::from),
                 "--model" => model_override = it.next(),
                 "--endpoint" => endpoint_override = it.next(),
+                "--path" => path_override = it.next().map(PathBuf::from),
+                "--here" | "." => here = true,
                 s if s.starts_with("--") => return Err(format!("unknown flag `{s}`")),
                 s => {
                     if name.is_some() {
@@ -168,12 +178,33 @@ impl Config {
                 }
             }
         }
-        let name = name.ok_or("missing <agent> argument")?;
 
+        // ── Single-agent modes (no workspace, no init) ───────────────────────
+        // `--path <dir>` / `--here` / `.`: run the agent in that directory
+        // directly — no workspace, no registry.
+        if let Some(dir) = path_override {
+            return Self::from_dir(dir, model_override, endpoint_override);
+        }
+        if here {
+            let cwd = std::env::current_dir().map_err(|e| format!("cwd: {e}"))?;
+            return Self::from_dir(cwd, model_override, endpoint_override);
+        }
+        // No agent named → the global **personal assistant** at `~/.bwoc/personal`
+        // (created on first use). A standalone agent with no workspace to init.
+        let Some(name) = name else {
+            let dir = ensure_personal_agent()?;
+            return Self::from_dir(dir, model_override, endpoint_override);
+        };
+
+        // ── Workspace mode (named agent from the registry) ───────────────────
         let workspace = workspace
             .or_else(|| std::env::var_os("BWOC_WORKSPACE").map(PathBuf::from))
             .or_else(resolve_workspace)
-            .ok_or("no workspace found (pass --workspace, set BWOC_WORKSPACE, or run from a workspace)")?;
+            .ok_or(
+                "no workspace found — pass --workspace / set BWOC_WORKSPACE / run from a \
+                 workspace, or run with no agent for the personal assistant (or --here for \
+                 the current directory)",
+            )?;
 
         let registry = AgentsRegistry::load(&workspace)
             .map_err(|e| format!("failed to read agents.toml: {e}"))?;
@@ -214,6 +245,79 @@ impl Config {
             endpoint,
         })
     }
+
+    /// Build a config for a single agent **directory** directly — no workspace,
+    /// no registry (`--path`, `--here`, or the personal assistant). The backend
+    /// is assumed harness-compatible (ollama / openai-compatible); model +
+    /// endpoint come from a `config.manifest.json` in the dir if present, else
+    /// the defaults.
+    fn from_dir(
+        dir: PathBuf,
+        model_override: Option<String>,
+        endpoint_override: Option<String>,
+    ) -> Result<Self, String> {
+        if !dir.is_dir() {
+            return Err(format!("not a directory: {}", dir.display()));
+        }
+        let agent_id = dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("agent")
+            .to_string();
+        let manifest = Manifest::load_from_path(&dir.join("config.manifest.json")).ok();
+        let model = model_override
+            .or_else(|| manifest.as_ref().map(|m| m.primary_model.clone()))
+            .unwrap_or_else(|| "gemma4:latest".to_string());
+        let endpoint = endpoint_override
+            .or_else(|| manifest.as_ref().and_then(|m| m.base_url.clone()))
+            .unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
+        Ok(Config {
+            agent_id,
+            agent_path: dir,
+            backend: "ollama".to_string(),
+            model,
+            endpoint,
+        })
+    }
+}
+
+/// System prompt for the auto-created personal assistant.
+const PERSONAL_SYSTEM_PROMPT: &str = "\
+You are the user's personal assistant. Be concise, friendly, and genuinely
+helpful. You can read files and run small tasks when asked; always ask before
+doing anything destructive or irreversible.";
+
+/// Default tool policy for the personal assistant: read freely, ask before
+/// writing or running (the chat window shows an Allow/Deny prompt).
+const PERSONAL_POLICY: &str = "\
+default_mode = \"ask\"
+
+[tools]
+read_file = \"allow\"
+list_dir = \"allow\"
+grep = \"allow\"
+";
+
+/// Resolve (and on first use, create) the global personal assistant at
+/// `~/.bwoc/personal` — a standalone agent that needs no workspace. Seeds a
+/// friendly `AGENTS.md` system prompt and a sensible `.bwoc/harness-policy.toml`.
+fn ensure_personal_agent() -> Result<PathBuf, String> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or("cannot find your home directory ($HOME unset)")?;
+    let dir = home.join(".bwoc").join("personal");
+    if !dir.join("AGENTS.md").is_file() {
+        std::fs::create_dir_all(dir.join(".bwoc"))
+            .map_err(|e| format!("create {}: {e}", dir.display()))?;
+        std::fs::write(dir.join("AGENTS.md"), PERSONAL_SYSTEM_PROMPT)
+            .map_err(|e| format!("seed AGENTS.md: {e}"))?;
+        std::fs::write(
+            dir.join(".bwoc").join("harness-policy.toml"),
+            PERSONAL_POLICY,
+        )
+        .map_err(|e| format!("seed harness-policy.toml: {e}"))?;
+    }
+    Ok(dir)
 }
 
 /// Ancestor walk for `.bwoc/workspace.toml` from the current directory.
