@@ -249,6 +249,9 @@ struct ChatApp {
     stdin: ChildStdin,
     rx: Receiver<ChatEvent>,
     child: Child,
+    /// Render cache for the CommonMark (markdown) viewer — code blocks, lists,
+    /// emphasis in assistant replies.
+    md_cache: egui_commonmark::CommonMarkCache,
 }
 
 impl ChatApp {
@@ -271,6 +274,7 @@ impl ChatApp {
             stdin,
             rx,
             child,
+            md_cache: egui_commonmark::CommonMarkCache::default(),
         }
     }
 
@@ -457,6 +461,9 @@ impl eframe::App for ChatApp {
             ui.add_space(4.0);
         });
 
+        // Take the markdown cache out of `self` so the conversation loop can
+        // borrow `&self.convo` immutably and the viewer `&mut cache` at once.
+        let mut md_cache = std::mem::take(&mut self.md_cache);
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
@@ -471,18 +478,36 @@ impl eframe::App for ChatApp {
                             ),
                             Who::System => ("·", egui::Color32::GRAY),
                         };
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(
-                                egui::RichText::new(format!("{tag}: "))
-                                    .color(color)
-                                    .strong(),
-                            );
-                            ui.label(text);
-                        });
-                        ui.add_space(4.0);
+                        match who {
+                            // Assistant replies render as markdown (code blocks,
+                            // lists, emphasis); the tag goes on its own line so a
+                            // fenced block gets full width.
+                            Who::Agent => {
+                                ui.label(
+                                    egui::RichText::new(format!("{tag}:")).color(color).strong(),
+                                );
+                                egui_commonmark::CommonMarkViewer::new().show(
+                                    ui,
+                                    &mut md_cache,
+                                    text,
+                                );
+                            }
+                            _ => {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(format!("{tag}: "))
+                                            .color(color)
+                                            .strong(),
+                                    );
+                                    ui.label(text);
+                                });
+                            }
+                        }
+                        ui.add_space(6.0);
                     }
                 });
         });
+        self.md_cache = md_cache;
 
         if do_send {
             self.send_user();
