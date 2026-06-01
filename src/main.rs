@@ -264,7 +264,7 @@ impl ChatApp {
             agent_id: cfg.agent_id,
             convo: vec![(
                 Who::System,
-                "Connected. Type a message and press Enter.".to_string(),
+                "Connected. Type a message and press Enter — or /help for commands.".to_string(),
             )],
             activity: Vec::new(),
             input: String::new(),
@@ -345,6 +345,32 @@ impl ChatApp {
         self.input.clear();
         self.busy = true;
         self.write_input(&ChatInput::User { text });
+    }
+
+    /// Handle a client-side `/command` (intercepted before it reaches the
+    /// harness). `ctx` is needed so `/quit` can close the window.
+    fn run_command(&mut self, line: &str, ctx: &egui::Context) {
+        let mut parts = line.trim().splitn(2, char::is_whitespace);
+        let name = parts.next().unwrap_or("").to_lowercase();
+        let _arg = parts.next().unwrap_or("").trim();
+        let sys = |s: &mut Self, text: String| s.convo.push((Who::System, text));
+        match name.as_str() {
+            "" | "help" | "?" => sys(
+                self,
+                "commands: /help · /clear (wipe view) · /quit (close)".to_string(),
+            ),
+            "clear" => {
+                self.convo.clear();
+                self.activity.clear();
+                sys(self, "conversation cleared.".to_string());
+            }
+            "quit" | "exit" => {
+                self.write_input(&ChatInput::Quit);
+                self.alive = false;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            other => sys(self, format!("unknown command `/{other}` — try /help")),
+        }
     }
 
     fn answer_permission(&mut self, allow: bool) {
@@ -434,7 +460,7 @@ impl eframe::App for ChatApp {
             } else {
                 ui.horizontal(|ui| {
                     let hint = if self.alive {
-                        "message…"
+                        "message…  (/help for commands)"
                     } else {
                         "(session ended)"
                     };
@@ -510,7 +536,14 @@ impl eframe::App for ChatApp {
         self.md_cache = md_cache;
 
         if do_send {
-            self.send_user();
+            // A leading `/` is a client-side command, not a message to the agent.
+            let text = self.input.trim().to_string();
+            if let Some(cmd) = text.strip_prefix('/') {
+                self.input.clear();
+                self.run_command(cmd, ctx);
+            } else {
+                self.send_user();
+            }
         }
         if let Some(allow) = perm {
             self.answer_permission(allow);
