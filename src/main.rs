@@ -50,6 +50,7 @@ const PALETTE: &[(u8, u8, u8)] = &[
 const COMMANDS: &[(&str, &str)] = &[
     ("/help", "list commands"),
     ("/tools", "list each agent's available tools"),
+    ("/mode", "permission mode: default | accept-edits | bypass"),
     ("/clear", "wipe the conversation + tool activity"),
     ("/forget", "clear every agent's memory of this conversation"),
     ("/quit", "close the window"),
@@ -509,6 +510,11 @@ struct ChatApp {
     sessions: Vec<AgentSession>,
     convo: Vec<Msg>,
     input: String,
+    /// Current permission mode (`default` / `accept_edits` / `bypass`), reflected
+    /// from the harness's `ModeChanged` ack. Shown in the status bar.
+    mode: String,
+    /// Directory whose entries the `@` completion popup lists (the launch cwd).
+    cwd: PathBuf,
     /// Render cache for the CommonMark (markdown) viewer.
     md_cache: egui_commonmark::CommonMarkCache,
 }
@@ -532,6 +538,8 @@ impl ChatApp {
                 text: hint,
             }],
             input: String::new(),
+            mode: "default".to_string(),
+            cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             md_cache: egui_commonmark::CommonMarkCache::default(),
             sessions,
         }
@@ -614,6 +622,17 @@ impl ChatApp {
             ChatEvent::PermissionRequest { id, tool, detail } => {
                 self.sessions[idx].pending = Some(Pending { id, tool, detail });
             }
+            ChatEvent::ModeChanged { mode } => {
+                // All sessions share the broadcast mode; reflect it once.
+                if self.mode != mode {
+                    self.mode = mode.clone();
+                    self.convo.push(Msg {
+                        who: Who::System,
+                        agent: 0,
+                        text: format!("permission mode → {mode}"),
+                    });
+                }
+            }
             ChatEvent::TurnEnd {
                 prompt_tokens,
                 completion_tokens,
@@ -687,6 +706,50 @@ impl ChatApp {
         }
     }
 
+    /// Completion suggestions for an `@`-prefixed input: team agents first, then
+    /// files/directories in the launch cwd. Each entry is `(label, insert)` where
+    /// `insert` is the full input string to substitute when the row is clicked.
+    /// Capped so the popup stays small.
+    fn at_suggestions(&self, frag: &str) -> Vec<(String, String)> {
+        let lower = frag.to_lowercase();
+        let mut out: Vec<(String, String)> = Vec::new();
+
+        // Agents (only meaningful in a team) — keep the `@` for routing.
+        if self.sessions.len() > 1 {
+            for s in &self.sessions {
+                let name = short(&s.id);
+                if name.to_lowercase().starts_with(&lower) {
+                    out.push((format!("@{name}  (agent)"), format!("@{name} ")));
+                }
+            }
+        }
+
+        // Files / directories in the cwd — insert the bare name (a path the
+        // agent can read); directories get a trailing `/`.
+        if let Ok(rd) = std::fs::read_dir(&self.cwd) {
+            let mut entries: Vec<(String, String)> = Vec::new();
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if name.starts_with('.') || !name.to_lowercase().starts_with(&lower) {
+                    continue;
+                }
+                let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                let display = if is_dir { format!("{name}/") } else { name.clone() };
+                let insert = if is_dir {
+                    format!("{name}/")
+                } else {
+                    format!("{name} ")
+                };
+                entries.push((format!("{display}  (file)"), insert));
+            }
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            out.extend(entries);
+        }
+
+        out.truncate(12);
+        out
+    }
+
     /// Split a leading `@name` off the message. Returns `(Some(idx), rest)` when
     /// `name` matches an agent's short name, else `(None, whole)` (broadcast).
     fn parse_target(&self, raw: &str) -> (Option<usize>, String) {
@@ -709,7 +772,7 @@ impl ChatApp {
     fn run_command(&mut self, line: &str, ctx: &egui::Context) {
         let mut parts = line.trim().splitn(2, char::is_whitespace);
         let name = parts.next().unwrap_or("").to_lowercase();
-        let _arg = parts.next().unwrap_or("").trim();
+        let arg = parts.next().unwrap_or("").trim().to_string();
         let sys = |s: &mut Self, text: String| {
             s.convo.push(Msg {
                 who: Who::System,
@@ -726,7 +789,7 @@ impl ChatApp {
                 };
                 sys(
                     self,
-                    format!("commands: /help · /tools · /clear · /forget · /quit{extra}"),
+                    format!("commands: /help · /tools · /mode · /clear · /forget · /quit{extra}"),
                 );
             }
             "tools" => {
@@ -738,6 +801,26 @@ impl ChatApp {
                         format!("{} ({} tools): {}", s.id, s.tools.len(), s.tools.join(", "))
                     };
                     sys(self, msg);
+                }
+            }
+            "mode" => {
+                let want = arg.trim();
+                if want.is_empty() {
+                    sys(
+                        self,
+                        format!(
+                            "permission mode: {} — set with /mode default | accept-edits | bypass",
+                            self.mode
+                        ),
+                    );
+                } else {
+                    // Broadcast the switch to every harness; each acks ModeChanged.
+                    let normalized = want.replace('-', "_");
+                    for s in &mut self.sessions {
+                        s.write(&ChatInput::SetMode {
+                            mode: normalized.clone(),
+                        });
+                    }
                 }
             }
             "clear" => {
@@ -787,11 +870,20 @@ impl eframe::App for ChatApp {
         // Permission decisions queued this frame: (session idx, allow).
         let mut perms: Vec<(usize, bool)> = Vec::new();
         let mut run_cmd: Option<&'static str> = None;
+        // A clicked `@`-completion row's replacement for the input buffer.
+        let mut pick: Option<String> = None;
 
         // ── Status bar: one chip per agent ───────────────────────────────────
         egui::TopBottomPanel::top("status").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.strong("bwoc-chat");
+                // Permission mode badge — amber when relaxed past the safe default.
+                let mode_color = if self.mode == "default" {
+                    egui::Color32::GRAY
+                } else {
+                    egui::Color32::from_rgb(0xE0, 0xA0, 0x30)
+                };
+                ui.label(egui::RichText::new(format!("[{}]", self.mode)).color(mode_color));
                 for s in &self.sessions {
                     ui.separator();
                     ui.label(
@@ -898,6 +990,25 @@ impl eframe::App for ChatApp {
                 ui.separator();
             }
 
+            // `@` completion: agents (team) + files/directories in the cwd.
+            if self.input.starts_with('@') {
+                let frag = self.input[1..].to_string();
+                let suggestions = self.at_suggestions(&frag);
+                if suggestions.is_empty() {
+                    ui.weak("no matching agent or file");
+                }
+                for (label, insert) in suggestions {
+                    if ui
+                        .add(egui::Button::new(egui::RichText::new(label)).frame(false))
+                        .on_hover_text("click to insert")
+                        .clicked()
+                    {
+                        pick = Some(insert);
+                    }
+                }
+                ui.separator();
+            }
+
             let alive = self.any_alive();
             ui.horizontal(|ui| {
                 let hint = if !alive {
@@ -972,6 +1083,10 @@ impl eframe::App for ChatApp {
         self.md_cache = md_cache;
 
         // ── Dispatch queued actions ──────────────────────────────────────────
+        if let Some(insert) = pick {
+            // A clicked `@`-completion row replaces the input buffer.
+            self.input = insert;
+        }
         if let Some(name) = run_cmd {
             self.input.clear();
             self.run_command(name.trim_start_matches('/'), ctx);
