@@ -2,7 +2,7 @@
 
 # 🜂 bwoc-chat
 
-**Native desktop chat for a single BWOC agent — one agent, one window.**
+**Native desktop chat for BWOC agents — one agent, or a whole team, in one window.**
 
 [![Rust](https://img.shields.io/badge/rust-2024-orange.svg?logo=rust)](https://www.rust-lang.org)
 [![UI: egui](https://img.shields.io/badge/ui-egui-blue.svg)](https://github.com/emilk/egui)
@@ -23,18 +23,21 @@ It spawns `bwoc-harness --chat` for an agent and draws the
 [`bwoc_core::chat_proto`](../bwoc-framwork/crates/bwoc-core/src/chat_proto.rs)
 event stream — the same wire format the in-terminal `bwoc chat --tui` uses.
 
-> The **harness** owns the session, tools, model calls, and the
-> guardrail → permission pipeline. This window only renders events and sends
-> your messages + permission decisions. One process = one window = one agent.
+> The **harness** owns each session, its tools, model calls, and the
+> guardrail → permission pipeline. This window only renders events and routes
+> your messages + permission decisions. Name several agents and each becomes its
+> own harness subprocess, multiplexed into one shared transcript.
 
 ## 🚀 Features
 
 - 🪟 **Native window** — pure-Rust [egui](https://github.com/emilk/egui)/eframe, no webview.
+- 👥 **Team chat** — name several agents for a group: a message broadcasts to all,
+  or `@name` addresses one; each reply streams in tagged + coloured by agent.
 - ⚡ **Streaming** — assistant tokens appear live as the model generates them.
-- 🔧 **Tool activity pane** — every `🔧 tool call` and `✓/✗ result` in real time.
+- 🔧 **Tool activity pane** — every `🔧 tool call` and `✓/✗ result` in real time, per agent.
 - ⚠️ **Inline permission** — `ask`-mode tools surface an **Allow / Deny** bar.
-- 🧭 **Zero config** — model + endpoint come from the agent's `config.manifest.json`.
-- 🧹 **Clean shutdown** — closing the window sends `quit` and reaps the harness.
+- 🧭 **Zero config** — model + endpoint come from each agent's `config.manifest.json`.
+- 🧹 **Clean shutdown** — closing the window sends `quit` and reaps every harness.
 
 ## 📦 Install
 
@@ -48,17 +51,23 @@ cargo run -- <agent>
 ## 🖱️ Usage
 
 ```bash
-bwoc-chat <agent> [--workspace <dir>] [--model <m>] [--endpoint <url>]
+bwoc-chat                                  # personal assistant (~/.bwoc/personal)
+bwoc-chat <agent>                          # one workspace agent, 1:1
+bwoc-chat <a> <b> <c>                      # team chat — several agents, one window
+bwoc-chat --here | --path <dir>            # an agent directory directly, no workspace
+#         [--workspace <dir>] [--model <m>] [--endpoint <url>]
 ```
 
-`<agent>` is resolved from the workspace registry (via `--workspace`,
+Named `<agent>`s are resolved from the workspace registry (via `--workspace`,
 `$BWOC_WORKSPACE`, or an ancestor `.bwoc/workspace.toml`).
 
 | Key / action | Effect |
 | --- | --- |
-| **Enter** / **Send** | send your message |
-| **Allow** / **Deny** | answer a pending permission request |
-| close window | end the session (sends `quit`, reaps the harness) |
+| **Enter** / **Send** | send your message (broadcasts to every agent in a team) |
+| `@name …` | address just one agent in a team (matched on its short name) |
+| **Allow** / **Deny** | answer a pending permission request (per agent) |
+| `/help` `/tools` `/clear` `/forget` `/quit` | client-side commands |
+| close window | end the session (sends `quit`, reaps every harness) |
 
 ## 🪟 The window
 

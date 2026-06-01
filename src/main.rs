@@ -1,16 +1,23 @@
-//! `bwoc-chat <agent>` — native desktop chat for ONE BWOC agent, ONE window.
+//! `bwoc-chat [<agent>...]` — native desktop chat for BWOC agents in ONE window.
 //!
-//! A thin egui frontend over the protocol the framework already speaks:
-//! it spawns `bwoc-harness --chat` for the agent and renders the
-//! `bwoc_core::chat_proto` event stream (the same wire format the ratatui
-//! `bwoc chat --tui` uses). The harness owns the session, tools, model calls,
-//! and the guardrail→permission pipeline; this window only renders events and
-//! sends user messages + permission decisions.
+//! A thin egui frontend over the protocol the framework already speaks: for each
+//! agent it spawns a `bwoc-harness --chat` subprocess and renders the
+//! `bwoc_core::chat_proto` event stream (the same wire format `bwoc chat --tui`
+//! uses). The harness owns each session, its tools, model calls, and the
+//! guardrail→permission pipeline; this window only renders events and routes
+//! user messages + permission decisions.
 //!
-//! Architecture (no async): a reader `std::thread` parses the child's stdout
-//! lines into `ChatEvent`s onto an `mpsc` channel; the egui update loop drains
-//! the channel each frame, repaints, and writes `ChatInput` lines to the
-//! child's stdin. One process = one window = one agent.
+//! **One window, N agents (team chat).** Name one agent for a 1:1 chat, or
+//! several for a group: the user's message broadcasts to every agent (or, with a
+//! leading `@name`, to just one), and each reply streams into the shared
+//! transcript tagged + coloured by agent. Each agent is an independent harness
+//! subprocess — they answer the user in parallel; they do not (yet) see each
+//! other's replies.
+//!
+//! Architecture (no async): per agent, a reader `std::thread` parses the child's
+//! stdout lines into `ChatEvent`s onto an `mpsc` channel; the egui update loop
+//! drains every channel each frame, repaints, and writes `ChatInput` lines back
+//! to each child's stdin.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -27,75 +34,64 @@ use eframe::egui;
 /// `baseUrl`. Mirrors the harness's own default.
 const DEFAULT_ENDPOINT: &str = "http://localhost:11434/v1";
 
+/// Per-agent accent colours, assigned by index so each agent is visually
+/// distinct in the shared transcript and status bar.
+const PALETTE: &[(u8, u8, u8)] = &[
+    (0x9E, 0xE0, 0x93), // green
+    (0xE0, 0xC0, 0x60), // amber
+    (0xC0, 0x90, 0xE0), // violet
+    (0x90, 0xC8, 0xE0), // sky
+    (0xE0, 0x90, 0x90), // rose
+    (0x80, 0xD8, 0xC0), // teal
+];
+
 /// Client-side slash commands: `(name, description)`. Surfaced as a filtered
 /// list when the input starts with `/`; dispatched by [`ChatApp::run_command`].
 const COMMANDS: &[(&str, &str)] = &[
     ("/help", "list commands"),
-    ("/tools", "list the agent's available tools"),
+    ("/tools", "list each agent's available tools"),
     ("/clear", "wipe the conversation + tool activity"),
-    ("/forget", "clear the agent's memory of this conversation"),
+    ("/forget", "clear every agent's memory of this conversation"),
     ("/quit", "close the window"),
 ];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let cfg = match Config::from_args(std::env::args().skip(1).collect()) {
+    let configs = match resolve(std::env::args().skip(1).collect()) {
         Ok(c) => c,
         Err(e) => {
             eprintln!(
                 "bwoc-chat: {e}\n\n\
-                 usage: bwoc-chat [<agent>] [--here | --path <dir>] [--workspace <dir>] \
+                 usage: bwoc-chat [<agent>...] [--here | --path <dir>] [--workspace <dir>] \
                  [--model <m>] [--endpoint <url>]\n\
                  \x20 no agent      → personal assistant at ~/.bwoc/personal (created on first use)\n\
                  \x20 --here / .    → the current directory, no workspace\n\
                  \x20 --path <dir>  → that directory directly\n\
-                 \x20 <agent>       → a named agent from the workspace registry"
+                 \x20 <agent>       → a named agent from the workspace registry\n\
+                 \x20 <a> <b> <c>   → team chat: several agents in one window"
             );
             std::process::exit(2);
         }
     };
 
-    // Spawn `bwoc-harness --chat` for this agent, piped both ways.
-    let harness = bwoc_core::exec::binary_or_name("bwoc-harness");
-    let mut child = Command::new(&harness)
-        .arg("--chat")
-        .arg("--workdir")
-        .arg(&cfg.agent_path)
-        .arg("--model")
-        .arg(&cfg.model)
-        .arg("--endpoint")
-        .arg(&cfg.endpoint)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .map_err(|e| format!("failed to spawn bwoc-harness ({harness:?}): {e}"))?;
+    // Spawn one harness session per agent. A spawn failure for any agent is
+    // fatal — better to fail loudly than open a half-empty team window.
+    let mut sessions = Vec::with_capacity(configs.len());
+    for (i, cfg) in configs.iter().enumerate() {
+        let color = palette(i);
+        sessions.push(AgentSession::spawn(cfg, color)?);
+    }
 
-    let stdin = child.stdin.take().expect("piped stdin");
-    let stdout = child.stdout.take().expect("piped stdout");
+    let title = if sessions.len() == 1 {
+        format!("bwoc · {}", sessions[0].id)
+    } else {
+        let names: Vec<&str> = sessions.iter().map(|s| short(&s.id)).collect();
+        format!("bwoc team · {}", names.join(", "))
+    };
 
-    // Reader thread: child stdout lines → ChatEvent → channel.
-    let (tx, rx) = mpsc::channel::<ChatEvent>();
-    std::thread::spawn(move || {
-        let reader = BufReader::new(stdout);
-        for line in reader.lines() {
-            let Ok(line) = line else { break };
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            if let Ok(ev) = serde_json::from_str::<ChatEvent>(line) {
-                if tx.send(ev).is_err() {
-                    break;
-                }
-            }
-        }
-    });
-
-    let title = format!("bwoc · {}", cfg.agent_id);
-    let app = ChatApp::new(cfg, stdin, rx, child);
+    let app = ChatApp::new(sessions);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([760.0, 560.0])
+            .with_inner_size([820.0, 600.0])
             .with_min_inner_size([480.0, 360.0])
             .with_title(title.clone()),
         ..Default::default()
@@ -110,6 +106,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .map_err(|e| format!("eframe: {e}"))?;
     Ok(())
+}
+
+fn palette(i: usize) -> egui::Color32 {
+    let (r, g, b) = PALETTE[i % PALETTE.len()];
+    egui::Color32::from_rgb(r, g, b)
+}
+
+/// An agent's short name — the registry id without the `agent-` prefix, used for
+/// `@mention` matching and compact labels.
+fn short(id: &str) -> &str {
+    id.strip_prefix("agent-").unwrap_or(id)
 }
 
 /// Install a Thai/Unicode-capable fallback font so non-Latin text (e.g. Thai)
@@ -146,7 +153,8 @@ fn install_fonts(ctx: &egui::Context) {
 // Agent resolution
 // ---------------------------------------------------------------------------
 
-struct Config {
+/// A resolved agent ready to spawn — model/endpoint already settled.
+struct AgentConfig {
     agent_id: String,
     agent_path: PathBuf,
     backend: String,
@@ -154,99 +162,136 @@ struct Config {
     endpoint: String,
 }
 
-impl Config {
-    fn from_args(args: Vec<String>) -> Result<Self, String> {
-        let mut name: Option<String> = None;
-        let mut workspace: Option<PathBuf> = None;
-        let mut model_override: Option<String> = None;
-        let mut endpoint_override: Option<String> = None;
-        let mut path_override: Option<PathBuf> = None;
-        let mut here = false;
-        let mut it = args.into_iter();
-        while let Some(a) = it.next() {
-            match a.as_str() {
-                "--workspace" => workspace = it.next().map(PathBuf::from),
-                "--model" => model_override = it.next(),
-                "--endpoint" => endpoint_override = it.next(),
-                "--path" => path_override = it.next().map(PathBuf::from),
-                "--here" | "." => here = true,
-                s if s.starts_with("--") => return Err(format!("unknown flag `{s}`")),
-                s => {
-                    if name.is_some() {
-                        return Err(format!("unexpected extra argument `{s}`"));
-                    }
-                    name = Some(s.to_string());
-                }
-            }
+/// Resolve CLI args into one or more agents to spawn.
+///
+/// - 0 names, no dir flag → the personal assistant (`~/.bwoc/personal`).
+/// - `--here` / `.` / `--path <dir>` → that directory directly (single only).
+/// - 1 name → that workspace agent.
+/// - N names → team chat: every named workspace agent in one window.
+fn resolve(args: Vec<String>) -> Result<Vec<AgentConfig>, String> {
+    let mut names: Vec<String> = Vec::new();
+    let mut workspace: Option<PathBuf> = None;
+    let mut model_override: Option<String> = None;
+    let mut endpoint_override: Option<String> = None;
+    let mut path_override: Option<PathBuf> = None;
+    let mut here = false;
+    let mut it = args.into_iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--workspace" => workspace = it.next().map(PathBuf::from),
+            "--model" => model_override = it.next(),
+            "--endpoint" => endpoint_override = it.next(),
+            "--path" => path_override = it.next().map(PathBuf::from),
+            "--here" | "." => here = true,
+            s if s.starts_with("--") => return Err(format!("unknown flag `{s}`")),
+            s => names.push(s.to_string()),
         }
-
-        // ── Single-agent modes (no workspace, no init) ───────────────────────
-        // `--path <dir>` / `--here` / `.`: run the agent in that directory
-        // directly — no workspace, no registry.
-        if let Some(dir) = path_override {
-            return Self::from_dir(dir, model_override, endpoint_override);
-        }
-        if here {
-            let cwd = std::env::current_dir().map_err(|e| format!("cwd: {e}"))?;
-            return Self::from_dir(cwd, model_override, endpoint_override);
-        }
-        // No agent named → the global **personal assistant** at `~/.bwoc/personal`
-        // (created on first use). A standalone agent with no workspace to init.
-        let Some(name) = name else {
-            let dir = ensure_personal_agent()?;
-            return Self::from_dir(dir, model_override, endpoint_override);
-        };
-
-        // ── Workspace mode (named agent from the registry) ───────────────────
-        let workspace = workspace
-            .or_else(|| std::env::var_os("BWOC_WORKSPACE").map(PathBuf::from))
-            .or_else(resolve_workspace)
-            .ok_or(
-                "no workspace found — pass --workspace / set BWOC_WORKSPACE / run from a \
-                 workspace, or run with no agent for the personal assistant (or --here for \
-                 the current directory)",
-            )?;
-
-        let registry = AgentsRegistry::load(&workspace)
-            .map_err(|e| format!("failed to read agents.toml: {e}"))?;
-        let lookup = if name.starts_with("agent-") {
-            name.clone()
-        } else {
-            format!("agent-{name}")
-        };
-        let entry = registry
-            .agents
-            .iter()
-            .find(|a| a.id == lookup)
-            .ok_or_else(|| format!("no agent named '{name}' in {}", workspace.display()))?;
-
-        // Only the harness-driven backends produce a chat_proto stream.
-        if !matches!(entry.backend.as_str(), "ollama" | "openai-compatible") {
-            return Err(format!(
-                "agent '{}' uses the '{}' backend — bwoc-chat only renders the harness chat \
-                 stream for ollama / openai-compatible. Use `bwoc spawn` for vendor CLIs.",
-                entry.id, entry.backend
-            ));
-        }
-
-        let agent_path = workspace.join(&entry.path);
-        let manifest = Manifest::load_from_path(&agent_path.join("config.manifest.json")).ok();
-        let model = model_override
-            .or_else(|| manifest.as_ref().map(|m| m.primary_model.clone()))
-            .unwrap_or_else(|| "gemma4:latest".to_string());
-        let endpoint = endpoint_override
-            .or_else(|| manifest.as_ref().and_then(|m| m.base_url.clone()))
-            .unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
-
-        Ok(Config {
-            agent_id: entry.id.clone(),
-            agent_path,
-            backend: entry.backend.clone(),
-            model,
-            endpoint,
-        })
     }
 
+    // ── Single-agent directory modes (no workspace, no init) ─────────────────
+    if let Some(dir) = path_override {
+        if !names.is_empty() {
+            return Err("--path takes no agent name (single-agent mode)".into());
+        }
+        return Ok(vec![AgentConfig::from_dir(
+            dir,
+            model_override,
+            endpoint_override,
+        )?]);
+    }
+    if here {
+        if !names.is_empty() {
+            return Err("--here / . takes no agent name (single-agent mode)".into());
+        }
+        let cwd = std::env::current_dir().map_err(|e| format!("cwd: {e}"))?;
+        return Ok(vec![AgentConfig::from_dir(
+            cwd,
+            model_override,
+            endpoint_override,
+        )?]);
+    }
+    // No agent named → the global **personal assistant** at `~/.bwoc/personal`.
+    if names.is_empty() {
+        let dir = ensure_personal_agent()?;
+        return Ok(vec![AgentConfig::from_dir(
+            dir,
+            model_override,
+            endpoint_override,
+        )?]);
+    }
+
+    // ── Workspace mode (one or more named agents from the registry) ──────────
+    let workspace = workspace
+        .or_else(|| std::env::var_os("BWOC_WORKSPACE").map(PathBuf::from))
+        .or_else(resolve_workspace)
+        .ok_or(
+            "no workspace found — pass --workspace / set BWOC_WORKSPACE / run from a \
+             workspace, or run with no agent for the personal assistant (or --here for \
+             the current directory)",
+        )?;
+    let registry = AgentsRegistry::load(&workspace)
+        .map_err(|e| format!("failed to read agents.toml: {e}"))?;
+
+    let mut configs = Vec::with_capacity(names.len());
+    for name in &names {
+        configs.push(resolve_workspace_agent(
+            name,
+            &workspace,
+            &registry,
+            model_override.clone(),
+            endpoint_override.clone(),
+        )?);
+    }
+    Ok(configs)
+}
+
+/// Resolve one named agent from the workspace registry into an [`AgentConfig`].
+fn resolve_workspace_agent(
+    name: &str,
+    workspace: &std::path::Path,
+    registry: &AgentsRegistry,
+    model_override: Option<String>,
+    endpoint_override: Option<String>,
+) -> Result<AgentConfig, String> {
+    let lookup = if name.starts_with("agent-") {
+        name.to_string()
+    } else {
+        format!("agent-{name}")
+    };
+    let entry = registry
+        .agents
+        .iter()
+        .find(|a| a.id == lookup)
+        .ok_or_else(|| format!("no agent named '{name}' in {}", workspace.display()))?;
+
+    // Only the harness-driven backends produce a chat_proto stream.
+    if !matches!(entry.backend.as_str(), "ollama" | "openai-compatible") {
+        return Err(format!(
+            "agent '{}' uses the '{}' backend — bwoc-chat only renders the harness chat \
+             stream for ollama / openai-compatible. Use `bwoc spawn` for vendor CLIs.",
+            entry.id, entry.backend
+        ));
+    }
+
+    let agent_path = workspace.join(&entry.path);
+    let manifest = Manifest::load_from_path(&agent_path.join("config.manifest.json")).ok();
+    let model = model_override
+        .or_else(|| manifest.as_ref().map(|m| m.primary_model.clone()))
+        .unwrap_or_else(|| "gemma4:latest".to_string());
+    let endpoint = endpoint_override
+        .or_else(|| manifest.as_ref().and_then(|m| m.base_url.clone()))
+        .unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
+
+    Ok(AgentConfig {
+        agent_id: entry.id.clone(),
+        agent_path,
+        backend: entry.backend.clone(),
+        model,
+        endpoint,
+    })
+}
+
+impl AgentConfig {
     /// Build a config for a single agent **directory** directly — no workspace,
     /// no registry (`--path`, `--here`, or the personal assistant). The backend
     /// is assumed harness-compatible (ollama / openai-compatible); model +
@@ -272,7 +317,7 @@ impl Config {
         let endpoint = endpoint_override
             .or_else(|| manifest.as_ref().and_then(|m| m.base_url.clone()))
             .unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
-        Ok(Config {
+        Ok(AgentConfig {
             agent_id,
             agent_path: dir,
             backend: "ollama".to_string(),
@@ -335,6 +380,109 @@ fn resolve_workspace() -> Option<PathBuf> {
 }
 
 // ---------------------------------------------------------------------------
+// Per-agent harness session
+// ---------------------------------------------------------------------------
+
+struct Pending {
+    id: String,
+    tool: String,
+    detail: String,
+}
+
+/// One agent = one `bwoc-harness --chat` subprocess plus the live UI state the
+/// window renders for it. Its [`Drop`] reaps the child so no harness is orphaned.
+struct AgentSession {
+    id: String,
+    color: egui::Color32,
+    /// Status-bar text (`model · backend · ready|busy|…`), updated from events.
+    status: String,
+    /// Tool names from this agent's `Ready` event (for `/tools`).
+    tools: Vec<String>,
+    /// Per-agent tool-call / result log shown in the activity panel.
+    activity: Vec<String>,
+    busy: bool,
+    alive: bool,
+    pending: Option<Pending>,
+    /// Index into [`ChatApp::convo`] of this agent's in-progress streamed reply,
+    /// so concurrent agents append to their own message rather than the last one.
+    cur: Option<usize>,
+    stdin: ChildStdin,
+    rx: Receiver<ChatEvent>,
+    child: Child,
+}
+
+impl AgentSession {
+    fn spawn(cfg: &AgentConfig, color: egui::Color32) -> Result<Self, String> {
+        let harness = bwoc_core::exec::binary_or_name("bwoc-harness");
+        let mut child = Command::new(&harness)
+            .arg("--chat")
+            .arg("--workdir")
+            .arg(&cfg.agent_path)
+            .arg("--model")
+            .arg(&cfg.model)
+            .arg("--endpoint")
+            .arg(&cfg.endpoint)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .map_err(|e| format!("failed to spawn bwoc-harness ({harness:?}) for {}: {e}", cfg.agent_id))?;
+
+        let stdin = child.stdin.take().expect("piped stdin");
+        let stdout = child.stdout.take().expect("piped stdout");
+
+        // Reader thread: child stdout lines → ChatEvent → channel.
+        let (tx, rx) = mpsc::channel::<ChatEvent>();
+        std::thread::spawn(move || {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines() {
+                let Ok(line) = line else { break };
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                if let Ok(ev) = serde_json::from_str::<ChatEvent>(line) {
+                    if tx.send(ev).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(AgentSession {
+            status: format!("{} · {} · connecting…", cfg.model, cfg.backend),
+            id: cfg.agent_id.clone(),
+            color,
+            tools: Vec::new(),
+            activity: Vec::new(),
+            busy: false,
+            alive: true,
+            pending: None,
+            cur: None,
+            stdin,
+            rx,
+            child,
+        })
+    }
+
+    fn write(&mut self, input: &ChatInput) {
+        if let Ok(line) = input.to_line() {
+            let _ = writeln!(self.stdin, "{line}");
+            let _ = self.stdin.flush();
+        }
+    }
+}
+
+impl Drop for AgentSession {
+    fn drop(&mut self) {
+        // Best-effort graceful shutdown, then reap so the harness never orphans.
+        self.write(&ChatInput::Quit);
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // UI
 // ---------------------------------------------------------------------------
 
@@ -345,341 +493,453 @@ enum Who {
     System,
 }
 
-struct Pending {
-    id: String,
-    tool: String,
-    detail: String,
+/// One line in the shared transcript. `agent` indexes [`ChatApp::sessions`] for
+/// `Who::Agent` (its tag + colour); ignored for user/system lines.
+struct Msg {
+    who: Who,
+    agent: usize,
+    text: String,
 }
 
 struct ChatApp {
-    agent_id: String,
-    status: String,
-    convo: Vec<(Who, String)>,
-    activity: Vec<String>,
+    sessions: Vec<AgentSession>,
+    convo: Vec<Msg>,
     input: String,
-    pending: Option<Pending>,
-    busy: bool,
-    alive: bool,
-    /// Tool names the agent has, from the `Ready` event (for `/tools`).
-    tools: Vec<String>,
-    stdin: ChildStdin,
-    rx: Receiver<ChatEvent>,
-    child: Child,
-    /// Render cache for the CommonMark (markdown) viewer — code blocks, lists,
-    /// emphasis in assistant replies.
+    /// Render cache for the CommonMark (markdown) viewer.
     md_cache: egui_commonmark::CommonMarkCache,
 }
 
 impl ChatApp {
-    fn new(cfg: Config, stdin: ChildStdin, rx: Receiver<ChatEvent>, child: Child) -> Self {
+    fn new(sessions: Vec<AgentSession>) -> Self {
+        let hint = if sessions.len() == 1 {
+            "Connected. Type a message and press Enter — or /help for commands.".to_string()
+        } else {
+            let names: Vec<String> = sessions.iter().map(|s| format!("@{}", short(&s.id))).collect();
+            format!(
+                "Team connected ({} agents). A message goes to all; prefix {} to address one. /help for commands.",
+                sessions.len(),
+                names.join(" / ")
+            )
+        };
         Self {
-            status: format!(
-                "{} · {} · {} · connecting…",
-                cfg.agent_id, cfg.model, cfg.backend
-            ),
-            agent_id: cfg.agent_id,
-            convo: vec![(
-                Who::System,
-                "Connected. Type a message and press Enter — or /help for commands.".to_string(),
-            )],
-            activity: Vec::new(),
+            convo: vec![Msg {
+                who: Who::System,
+                agent: 0,
+                text: hint,
+            }],
             input: String::new(),
-            pending: None,
-            busy: false,
-            alive: true,
-            tools: Vec::new(),
-            stdin,
-            rx,
-            child,
             md_cache: egui_commonmark::CommonMarkCache::default(),
+            sessions,
         }
     }
 
-    fn apply(&mut self, ev: ChatEvent) {
+    fn team(&self) -> bool {
+        self.sessions.len() > 1
+    }
+
+    fn any_alive(&self) -> bool {
+        self.sessions.iter().any(|s| s.alive)
+    }
+
+    fn any_busy(&self) -> bool {
+        self.sessions.iter().any(|s| s.busy)
+    }
+
+    /// Apply one event from agent `idx`.
+    fn apply(&mut self, idx: usize, ev: ChatEvent) {
         match ev {
             ChatEvent::Ready {
-                agent,
                 model,
                 backend,
                 tools,
+                ..
             } => {
-                self.status = format!("{agent} · {model} · {backend} · ready");
-                self.tools = tools;
+                let s = &mut self.sessions[idx];
+                s.status = format!("{model} · {backend} · ready");
+                s.tools = tools;
             }
             ChatEvent::Restored { role, text } => {
-                // A turn replayed from a persisted session — show it in history.
-                let who = if role == "user" {
-                    Who::User
-                } else {
-                    Who::Agent
-                };
-                self.convo.push((who, text));
+                let who = if role == "user" { Who::User } else { Who::Agent };
+                self.convo.push(Msg {
+                    who,
+                    agent: idx,
+                    text,
+                });
             }
             ChatEvent::Token { text } => {
-                // Append streamed tokens onto the in-progress agent message.
-                match self.convo.last_mut() {
-                    Some((Who::Agent, s)) if self.busy => s.push_str(&text),
-                    _ => self.convo.push((Who::Agent, text)),
+                // Append onto this agent's in-progress reply, or open a new one.
+                match self.sessions[idx].cur {
+                    Some(ci) => self.convo[ci].text.push_str(&text),
+                    None => {
+                        self.convo.push(Msg {
+                            who: Who::Agent,
+                            agent: idx,
+                            text,
+                        });
+                        self.sessions[idx].cur = Some(self.convo.len() - 1);
+                    }
                 }
             }
             ChatEvent::Message { text } => {
-                // Final assistant text for the turn (overrides any streamed buffer).
-                match self.convo.last_mut() {
-                    Some((Who::Agent, s)) if self.busy => *s = text,
-                    _ => self.convo.push((Who::Agent, text)),
+                // Final assistant text — overwrite the streamed buffer if any.
+                match self.sessions[idx].cur {
+                    Some(ci) => self.convo[ci].text = text,
+                    None => {
+                        self.convo.push(Msg {
+                            who: Who::Agent,
+                            agent: idx,
+                            text,
+                        });
+                        self.sessions[idx].cur = Some(self.convo.len() - 1);
+                    }
                 }
             }
             ChatEvent::ToolCall { name, args, .. } => {
-                self.activity
+                self.sessions[idx]
+                    .activity
                     .push(format!("» {name} {}", truncate(&args, 80)));
             }
             ChatEvent::ToolResult {
                 name, ok, output, ..
             } => {
                 let mark = if ok { "[ok]" } else { "[err]" };
-                self.activity
+                self.sessions[idx]
+                    .activity
                     .push(format!("{mark} {name}: {}", truncate(&output, 80)));
             }
             ChatEvent::PermissionRequest { id, tool, detail } => {
-                self.pending = Some(Pending { id, tool, detail });
+                self.sessions[idx].pending = Some(Pending { id, tool, detail });
             }
             ChatEvent::TurnEnd {
                 prompt_tokens,
                 completion_tokens,
             } => {
-                self.busy = false;
-                self.status = format!(
-                    "{} · ready · tokens {} in / {} out",
-                    self.agent_id, prompt_tokens, completion_tokens
-                );
+                let s = &mut self.sessions[idx];
+                s.busy = false;
+                s.cur = None;
+                s.status = format!("ready · tokens {prompt_tokens} in / {completion_tokens} out");
             }
             ChatEvent::Error { message } => {
-                self.busy = false;
-                self.convo.push((Who::System, format!("error: {message}")));
+                let s = &mut self.sessions[idx];
+                s.busy = false;
+                s.cur = None;
+                let id = s.id.clone();
+                self.convo.push(Msg {
+                    who: Who::System,
+                    agent: idx,
+                    text: format!("{id} error: {message}"),
+                });
             }
             ChatEvent::Bye => {
-                self.alive = false;
-                self.convo.push((Who::System, "session ended.".to_string()));
+                let s = &mut self.sessions[idx];
+                s.alive = false;
+                let id = s.id.clone();
+                self.convo.push(Msg {
+                    who: Who::System,
+                    agent: idx,
+                    text: format!("{id} session ended."),
+                });
             }
         }
     }
 
+    /// Route the typed text. A bare message broadcasts to every alive agent; a
+    /// leading `@name` (matched against an agent's short name) targets just that
+    /// one. The raw text (with any `@name`) is shown in the transcript so the
+    /// user sees who they addressed; the `@name` is stripped before sending.
     fn send_user(&mut self) {
-        let text = self.input.trim().to_string();
-        if text.is_empty() || !self.alive {
+        let raw = self.input.trim().to_string();
+        if raw.is_empty() || !self.any_alive() {
             return;
         }
-        self.convo.push((Who::User, text.clone()));
         self.input.clear();
-        self.busy = true;
-        self.write_input(&ChatInput::User { text });
+
+        let (target, body) = self.parse_target(&raw);
+        if body.is_empty() {
+            self.convo.push(Msg {
+                who: Who::System,
+                agent: 0,
+                text: "(empty message — nothing sent)".to_string(),
+            });
+            return;
+        }
+        self.convo.push(Msg {
+            who: Who::User,
+            agent: 0,
+            text: raw,
+        });
+        for i in 0..self.sessions.len() {
+            if !self.sessions[i].alive {
+                continue;
+            }
+            if let Some(t) = target {
+                if t != i {
+                    continue;
+                }
+            }
+            self.sessions[i].busy = true;
+            self.sessions[i].cur = None;
+            self.sessions[i].write(&ChatInput::User { text: body.clone() });
+        }
     }
 
-    /// Handle a client-side `/command` (intercepted before it reaches the
-    /// harness). `ctx` is needed so `/quit` can close the window.
+    /// Split a leading `@name` off the message. Returns `(Some(idx), rest)` when
+    /// `name` matches an agent's short name, else `(None, whole)` (broadcast).
+    fn parse_target(&self, raw: &str) -> (Option<usize>, String) {
+        if let Some(rest) = raw.strip_prefix('@') {
+            let mut parts = rest.splitn(2, char::is_whitespace);
+            let name = parts.next().unwrap_or("");
+            let body = parts.next().unwrap_or("").trim();
+            if let Some(idx) = self
+                .sessions
+                .iter()
+                .position(|s| short(&s.id).eq_ignore_ascii_case(name))
+            {
+                return (Some(idx), body.to_string());
+            }
+        }
+        (None, raw.to_string())
+    }
+
+    /// Handle a client-side `/command` (intercepted before it reaches a harness).
     fn run_command(&mut self, line: &str, ctx: &egui::Context) {
         let mut parts = line.trim().splitn(2, char::is_whitespace);
         let name = parts.next().unwrap_or("").to_lowercase();
         let _arg = parts.next().unwrap_or("").trim();
-        let sys = |s: &mut Self, text: String| s.convo.push((Who::System, text));
+        let sys = |s: &mut Self, text: String| {
+            s.convo.push(Msg {
+                who: Who::System,
+                agent: 0,
+                text,
+            })
+        };
         match name.as_str() {
-            "" | "help" | "?" => sys(
-                self,
-                "commands: /help · /clear (wipe view) · /quit (close)".to_string(),
-            ),
-            "tools" => {
-                let msg = if self.tools.is_empty() {
-                    "no tools reported (older harness, or none registered).".to_string()
+            "" | "help" | "?" => {
+                let extra = if self.team() {
+                    " · @name to address one agent, bare message broadcasts to all"
                 } else {
-                    format!("{} tools: {}", self.tools.len(), self.tools.join(", "))
+                    ""
                 };
-                sys(self, msg);
+                sys(
+                    self,
+                    format!("commands: /help · /tools · /clear · /forget · /quit{extra}"),
+                );
+            }
+            "tools" => {
+                for i in 0..self.sessions.len() {
+                    let s = &self.sessions[i];
+                    let msg = if s.tools.is_empty() {
+                        format!("{}: no tools reported.", s.id)
+                    } else {
+                        format!("{} ({} tools): {}", s.id, s.tools.len(), s.tools.join(", "))
+                    };
+                    sys(self, msg);
+                }
             }
             "clear" => {
                 self.convo.clear();
-                self.activity.clear();
+                for s in &mut self.sessions {
+                    s.activity.clear();
+                    s.cur = None;
+                }
                 sys(self, "conversation cleared.".to_string());
             }
             "forget" => {
-                // Tell the harness to drop its memory + the on-disk session,
-                // and clear our display too.
-                self.write_input(&ChatInput::Forget);
+                // Tell every harness to drop its memory + on-disk session.
+                for s in &mut self.sessions {
+                    s.write(&ChatInput::Forget);
+                    s.activity.clear();
+                    s.cur = None;
+                }
                 self.convo.clear();
-                self.activity.clear();
                 sys(
                     self,
-                    "memory cleared — the agent will start fresh.".to_string(),
+                    "memory cleared — every agent starts fresh.".to_string(),
                 );
             }
             "quit" | "exit" => {
-                self.write_input(&ChatInput::Quit);
-                self.alive = false;
+                for s in &mut self.sessions {
+                    s.write(&ChatInput::Quit);
+                    s.alive = false;
+                }
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
             other => sys(self, format!("unknown command `/{other}` — try /help")),
         }
     }
-
-    fn answer_permission(&mut self, allow: bool) {
-        if let Some(p) = self.pending.take() {
-            self.activity.push(format!(
-                "{} {}",
-                if allow { "[allowed]" } else { "[denied]" },
-                p.tool
-            ));
-            self.write_input(&ChatInput::Permission { id: p.id, allow });
-        }
-    }
-
-    fn write_input(&mut self, input: &ChatInput) {
-        if let Ok(line) = input.to_line() {
-            let _ = writeln!(self.stdin, "{line}");
-            let _ = self.stdin.flush();
-        }
-    }
-}
-
-impl Drop for ChatApp {
-    fn drop(&mut self) {
-        // Best-effort graceful shutdown, then reap so the harness never orphans.
-        self.write_input(&ChatInput::Quit);
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
 }
 
 impl eframe::App for ChatApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Drain everything the reader thread queued since last frame.
-        let events: Vec<ChatEvent> = self.rx.try_iter().collect();
-        for ev in events {
-            self.apply(ev);
+        // Drain every agent's channel since last frame.
+        for idx in 0..self.sessions.len() {
+            let events: Vec<ChatEvent> = self.sessions[idx].rx.try_iter().collect();
+            for ev in events {
+                self.apply(idx, ev);
+            }
         }
 
         let mut do_send = false;
-        let mut perm: Option<bool> = None;
+        // Permission decisions queued this frame: (session idx, allow).
+        let mut perms: Vec<(usize, bool)> = Vec::new();
         let mut run_cmd: Option<&'static str> = None;
 
+        // ── Status bar: one chip per agent ───────────────────────────────────
         egui::TopBottomPanel::top("status").show(ctx, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.strong("bwoc-chat");
-                ui.separator();
-                ui.label(&self.status);
-                if self.busy {
-                    ui.spinner();
+                for s in &self.sessions {
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new(short(&s.id))
+                            .color(s.color)
+                            .strong(),
+                    );
+                    ui.weak(&s.status);
+                    if s.busy {
+                        ui.spinner();
+                    }
                 }
             });
         });
 
+        // ── Activity panel: tool calls/results, grouped by agent ─────────────
         egui::SidePanel::right("activity")
-            .default_width(240.0)
+            .default_width(260.0)
             .show(ctx, |ui| {
-                ui.heading("tools");
+                ui.heading("activity");
                 ui.separator();
                 egui::ScrollArea::vertical()
                     .stick_to_bottom(true)
                     .show(ui, |ui| {
-                        if self.activity.is_empty() {
-                            ui.weak("(no tool activity yet)");
+                        let team = self.sessions.len() > 1;
+                        let mut any = false;
+                        for s in &self.sessions {
+                            if s.activity.is_empty() {
+                                continue;
+                            }
+                            any = true;
+                            if team {
+                                ui.label(
+                                    egui::RichText::new(short(&s.id)).color(s.color).strong(),
+                                );
+                            }
+                            for line in &s.activity {
+                                ui.label(line);
+                            }
+                            if team {
+                                ui.add_space(4.0);
+                            }
                         }
-                        for line in &self.activity {
-                            ui.label(line);
+                        if !any {
+                            ui.weak("(no tool activity yet)");
                         }
                     });
             });
 
+        // ── Bottom: pending permissions + input ──────────────────────────────
         egui::TopBottomPanel::bottom("input").show(ctx, |ui| {
             ui.add_space(4.0);
-            if let Some(p) = &self.pending {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(
-                        egui::RichText::new(format!("permission: {} ", p.tool))
-                            .color(egui::Color32::from_rgb(0xE0, 0xA0, 0x30))
-                            .strong(),
-                    );
-                    ui.label(truncate(&p.detail, 120));
-                    if ui.button("Allow").clicked() {
-                        perm = Some(true);
-                    }
-                    if ui.button("Deny").clicked() {
-                        perm = Some(false);
-                    }
-                });
-            } else {
-                // Slash-command list: when the input starts with `/`, show the
-                // matching commands above the input. Click a row to run it.
-                if self.input.starts_with('/') {
-                    let typed = &self.input[1..];
-                    let matches: Vec<(&'static str, &'static str)> = COMMANDS
-                        .iter()
-                        .copied()
-                        .filter(|(name, _)| name[1..].starts_with(typed))
-                        .collect();
-                    if matches.is_empty() {
-                        ui.weak("no matching command — /help");
-                    }
-                    for (name, desc) in matches {
-                        let label = egui::RichText::new(format!("{name}  —  {desc}"));
-                        if ui
-                            .add(egui::Button::new(label).frame(false))
-                            .on_hover_text("click to run")
-                            .clicked()
-                        {
-                            run_cmd = Some(name);
+            let team = self.sessions.len() > 1;
+            let mut any_pending = false;
+            for (i, s) in self.sessions.iter().enumerate() {
+                if let Some(p) = &s.pending {
+                    any_pending = true;
+                    ui.horizontal_wrapped(|ui| {
+                        let who = if team {
+                            format!("permission [{}]: {} ", short(&s.id), p.tool)
+                        } else {
+                            format!("permission: {} ", p.tool)
+                        };
+                        ui.label(
+                            egui::RichText::new(who)
+                                .color(egui::Color32::from_rgb(0xE0, 0xA0, 0x30))
+                                .strong(),
+                        );
+                        ui.label(truncate(&p.detail, 120));
+                        if ui.button("Allow").clicked() {
+                            perms.push((i, true));
                         }
-                    }
-                    ui.separator();
+                        if ui.button("Deny").clicked() {
+                            perms.push((i, false));
+                        }
+                    });
                 }
-                ui.horizontal(|ui| {
-                    let hint = if self.alive {
-                        "message…  (/help for commands)"
-                    } else {
-                        "(session ended)"
-                    };
-                    let resp = ui.add_enabled(
-                        self.alive,
-                        egui::TextEdit::singleline(&mut self.input)
-                            .desired_width(f32::INFINITY)
-                            .hint_text(hint),
-                    );
-                    let entered =
-                        resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    if entered {
-                        do_send = true;
-                        resp.request_focus();
-                    }
+            }
+            if any_pending {
+                ui.separator();
+            }
+
+            // Slash-command list when the input starts with `/`.
+            if self.input.starts_with('/') {
+                let typed = &self.input[1..];
+                let matches: Vec<(&'static str, &'static str)> = COMMANDS
+                    .iter()
+                    .copied()
+                    .filter(|(name, _)| name[1..].starts_with(typed))
+                    .collect();
+                if matches.is_empty() {
+                    ui.weak("no matching command — /help");
+                }
+                for (name, desc) in matches {
+                    let label = egui::RichText::new(format!("{name}  —  {desc}"));
                     if ui
-                        .add_enabled(self.alive, egui::Button::new("Send"))
+                        .add(egui::Button::new(label).frame(false))
+                        .on_hover_text("click to run")
                         .clicked()
                     {
-                        do_send = true;
+                        run_cmd = Some(name);
                     }
-                });
+                }
+                ui.separator();
             }
+
+            let alive = self.any_alive();
+            ui.horizontal(|ui| {
+                let hint = if !alive {
+                    "(all sessions ended)"
+                } else if team {
+                    "message all…  (@name to target · /help)"
+                } else {
+                    "message…  (/help for commands)"
+                };
+                let resp = ui.add_enabled(
+                    alive,
+                    egui::TextEdit::singleline(&mut self.input)
+                        .desired_width(f32::INFINITY)
+                        .hint_text(hint),
+                );
+                let entered = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if entered {
+                    do_send = true;
+                    resp.request_focus();
+                }
+                if ui.add_enabled(alive, egui::Button::new("Send")).clicked() {
+                    do_send = true;
+                }
+            });
             ui.add_space(4.0);
         });
 
-        // Take the markdown cache out of `self` so the conversation loop can
-        // borrow `&self.convo` immutably and the viewer `&mut cache` at once.
+        // ── Central: shared transcript ───────────────────────────────────────
         let mut md_cache = std::mem::take(&mut self.md_cache);
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .stick_to_bottom(true)
                 .show(ui, |ui| {
-                    for (who, text) in &self.convo {
-                        let (tag, color) = match who {
+                    for msg in &self.convo {
+                        let (tag, color): (&str, egui::Color32) = match msg.who {
                             Who::User => ("you", egui::Color32::from_rgb(0x6C, 0xB6, 0xFF)),
-                            Who::Agent => (
-                                self.agent_id.as_str(),
-                                egui::Color32::from_rgb(0x9E, 0xE0, 0x93),
-                            ),
+                            Who::Agent => {
+                                let s = &self.sessions[msg.agent];
+                                (short(&s.id), s.color)
+                            }
                             Who::System => ("·", egui::Color32::GRAY),
                         };
-                        match who {
-                            // Assistant replies render as markdown (code blocks,
-                            // lists, emphasis); the tag goes on its own line so a
-                            // fenced block gets full width.
+                        match msg.who {
+                            // Assistant replies render as markdown; the tag goes
+                            // on its own line so fenced blocks get full width.
                             Who::Agent => {
                                 ui.label(
                                     egui::RichText::new(format!("{tag}:")).color(color).strong(),
@@ -687,7 +947,7 @@ impl eframe::App for ChatApp {
                                 egui_commonmark::CommonMarkViewer::new().show(
                                     ui,
                                     &mut md_cache,
-                                    text,
+                                    &msg.text,
                                 );
                             }
                             _ => {
@@ -697,7 +957,7 @@ impl eframe::App for ChatApp {
                                             .color(color)
                                             .strong(),
                                     );
-                                    ui.label(text);
+                                    ui.label(&msg.text);
                                 });
                             }
                         }
@@ -707,12 +967,12 @@ impl eframe::App for ChatApp {
         });
         self.md_cache = md_cache;
 
-        // A clicked command from the slash list runs immediately.
+        // ── Dispatch queued actions ──────────────────────────────────────────
         if let Some(name) = run_cmd {
             self.input.clear();
             self.run_command(name.trim_start_matches('/'), ctx);
         } else if do_send {
-            // A leading `/` is a client-side command, not a message to the agent.
+            // A leading `/` is a client-side command, not a message to an agent.
             let text = self.input.trim().to_string();
             if let Some(cmd) = text.strip_prefix('/') {
                 self.input.clear();
@@ -721,12 +981,23 @@ impl eframe::App for ChatApp {
                 self.send_user();
             }
         }
-        if let Some(allow) = perm {
-            self.answer_permission(allow);
+        for (i, allow) in perms {
+            if let Some(p) = self.sessions[i].pending.take() {
+                self.sessions[i].activity.push(format!(
+                    "{} {}",
+                    if allow { "[allowed]" } else { "[denied]" },
+                    p.tool
+                ));
+                self.sessions[i].write(&ChatInput::Permission { id: p.id, allow });
+            }
         }
 
-        // Poll the channel a few times a second even without input events.
-        ctx.request_repaint_after(Duration::from_millis(80));
+        // Poll the channels a few times a second even without input events.
+        if self.any_busy() {
+            ctx.request_repaint_after(Duration::from_millis(50));
+        } else {
+            ctx.request_repaint_after(Duration::from_millis(120));
+        }
     }
 }
 

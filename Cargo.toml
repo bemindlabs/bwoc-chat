@@ -3,7 +3,7 @@ name = "bwoc-chat"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Native desktop chat for a single BWOC agent — one agent, one window. Renders the bwoc-harness --chat (chat_proto) stream in an egui window."
+description = "Native desktop chat for BWOC agents — one agent or a whole team in one window. Renders the bwoc-harness --chat (chat_proto) stream in an egui window."
 license = "MIT"
 
 [[bin]]
