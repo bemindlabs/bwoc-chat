@@ -34,6 +34,10 @@ use eframe::egui;
 /// `baseUrl`. Mirrors the harness's own default.
 const DEFAULT_ENDPOINT: &str = "http://localhost:11434/v1";
 
+/// Line height as a multiple of font size for transcript messages. ~1.4 leaves
+/// room for stacked Thai vowel/tone marks that the default font metrics clip.
+const LINE_HEIGHT_FACTOR: f32 = 1.4;
+
 /// Per-agent accent colours, assigned by index so each agent is visually
 /// distinct in the shared transcript and status bar.
 const PALETTE: &[(u8, u8, u8)] = &[
@@ -50,7 +54,10 @@ const PALETTE: &[(u8, u8, u8)] = &[
 const COMMANDS: &[(&str, &str)] = &[
     ("/help", "list commands"),
     ("/tools", "list each agent's available tools"),
-    ("/mode", "permission mode: default | accept-edits | bypass | plan"),
+    (
+        "/mode",
+        "permission mode: default | accept-edits | bypass | plan",
+    ),
     ("/clear", "wipe the conversation + tool activity"),
     ("/forget", "clear every agent's memory of this conversation"),
     ("/quit", "close the window"),
@@ -102,6 +109,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         options,
         Box::new(|cc| {
             install_fonts(&cc.egui_ctx);
+            // Wrap text by default so long lines (esp. space-less scripts like
+            // Thai, which egui can't break on whitespace) never run past the
+            // panel edge.
+            cc.egui_ctx
+                .style_mut(|s| s.wrap_mode = Some(egui::TextWrapMode::Wrap));
             Ok(Box::new(app))
         }),
     )
@@ -230,8 +242,8 @@ fn resolve(args: Vec<String>) -> Result<Vec<AgentConfig>, String> {
              workspace, or run with no agent for the personal assistant (or --here for \
              the current directory)",
         )?;
-    let registry = AgentsRegistry::load(&workspace)
-        .map_err(|e| format!("failed to read agents.toml: {e}"))?;
+    let registry =
+        AgentsRegistry::load(&workspace).map_err(|e| format!("failed to read agents.toml: {e}"))?;
 
     let mut configs = Vec::with_capacity(names.len());
     for name in &names {
@@ -416,7 +428,10 @@ impl ActivityItem {
 
     /// A row that is only ever a one-liner (e.g. a permission decision).
     fn line(summary: String) -> Self {
-        ActivityItem { summary, body: String::new() }
+        ActivityItem {
+            summary,
+            body: String::new(),
+        }
     }
 }
 
@@ -466,7 +481,12 @@ impl AgentSession {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
-            .map_err(|e| format!("failed to spawn bwoc-harness ({harness:?}) for {}: {e}", cfg.agent_id))?;
+            .map_err(|e| {
+                format!(
+                    "failed to spawn bwoc-harness ({harness:?}) for {}: {e}",
+                    cfg.agent_id
+                )
+            })?;
 
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
@@ -559,7 +579,10 @@ impl ChatApp {
         let hint = if sessions.len() == 1 {
             "Connected. Type a message and press Enter — or /help for commands.".to_string()
         } else {
-            let names: Vec<String> = sessions.iter().map(|s| format!("@{}", short(&s.id))).collect();
+            let names: Vec<String> = sessions
+                .iter()
+                .map(|s| format!("@{}", short(&s.id)))
+                .collect();
             format!(
                 "Team connected ({} agents). A message goes to all; prefix {} to address one. /help for commands.",
                 sessions.len(),
@@ -606,7 +629,11 @@ impl ChatApp {
                 s.tools = tools;
             }
             ChatEvent::Restored { role, text } => {
-                let who = if role == "user" { Who::User } else { Who::Agent };
+                let who = if role == "user" {
+                    Who::User
+                } else {
+                    Who::Agent
+                };
                 self.convo.push(Msg {
                     who,
                     agent: idx,
@@ -778,7 +805,11 @@ impl ChatApp {
                     continue;
                 }
                 let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
-                let display = if is_dir { format!("{name}/") } else { name.clone() };
+                let display = if is_dir {
+                    format!("{name}/")
+                } else {
+                    name.clone()
+                };
                 let insert = if is_dir {
                     format!("{name}/")
                 } else {
@@ -930,11 +961,7 @@ impl eframe::App for ChatApp {
                 ui.label(egui::RichText::new(format!("[{}]", self.mode)).color(mode_color));
                 for s in &self.sessions {
                     ui.separator();
-                    ui.label(
-                        egui::RichText::new(short(&s.id))
-                            .color(s.color)
-                            .strong(),
-                    );
+                    ui.label(egui::RichText::new(short(&s.id)).color(s.color).strong());
                     ui.weak(&s.status);
                     if s.busy {
                         ui.spinner();
@@ -968,9 +995,7 @@ impl eframe::App for ChatApp {
                             }
                             any = true;
                             if team {
-                                ui.label(
-                                    egui::RichText::new(short(&s.id)).color(s.color).strong(),
-                                );
+                                ui.label(egui::RichText::new(short(&s.id)).color(s.color).strong());
                             }
                             for item in &s.activity {
                                 row += 1;
@@ -1135,17 +1160,22 @@ impl eframe::App for ChatApp {
                                 );
                             }
                             _ => {
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.label(
-                                        egui::RichText::new(format!("{tag}: "))
-                                            .color(color)
-                                            .strong(),
-                                    );
-                                    ui.label(&msg.text);
-                                });
+                                let body = egui::TextStyle::Body.resolve(ui.style());
+                                let line_h = body.size * LINE_HEIGHT_FACTOR;
+                                let text_color = ui.visuals().text_color();
+                                let job = build_message_job(
+                                    tag,
+                                    &msg.text,
+                                    color,
+                                    text_color,
+                                    body,
+                                    line_h,
+                                    ui.available_width(),
+                                );
+                                ui.label(job);
                             }
                         }
-                        ui.add_space(6.0);
+                        ui.add_space(8.0);
                     }
                 });
         });
@@ -1197,5 +1227,105 @@ fn truncate(s: &str, max: usize) -> String {
         let mut t: String = one_line.chars().take(max).collect();
         t.push('…');
         t
+    }
+}
+
+/// Build the single wrapping galley job for one user/system transcript line:
+/// a coloured `"tag: "` prefix + body, wrapped at `max_width` so space-less
+/// scripts (e.g. Thai) break at the panel edge, with an explicit `line_height`
+/// so stacked Thai vowel/tone marks aren't clipped. Extracted from the render
+/// loop so the wrapping + line-height behaviour can be unit-tested headlessly.
+fn build_message_job(
+    tag: &str,
+    text: &str,
+    tag_color: egui::Color32,
+    text_color: egui::Color32,
+    font: egui::FontId,
+    line_height: f32,
+    max_width: f32,
+) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    job.wrap.max_width = max_width;
+    job.append(
+        &format!("{tag}: "),
+        0.0,
+        egui::TextFormat {
+            font_id: font.clone(),
+            color: tag_color,
+            line_height: Some(line_height),
+            ..Default::default()
+        },
+    );
+    job.append(
+        text,
+        0.0,
+        egui::TextFormat {
+            font_id: font,
+            color: text_color,
+            line_height: Some(line_height),
+            ..Default::default()
+        },
+    );
+    job
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Lay a message job out through egui's real text engine, headless.
+    /// `Context::fonts` needs one `run()` first to construct the font atlas.
+    fn layout(text: &str, max_width: f32, line_height: f32) -> std::sync::Arc<egui::Galley> {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |_| {});
+        let job = build_message_job(
+            "you",
+            text,
+            egui::Color32::WHITE,
+            egui::Color32::WHITE,
+            egui::FontId::proportional(14.0),
+            line_height,
+            max_width,
+        );
+        ctx.fonts(|f| f.layout_job(job))
+    }
+
+    #[test]
+    fn spaceless_text_wraps_to_width() {
+        // No whitespace → egui can only break it via the explicit wrap width.
+        // This is exactly the Thai-overflow case (Thai has no inter-word spaces);
+        // a long no-space ASCII run reproduces it deterministically without
+        // depending on a Thai font being installed on the test host.
+        let long = "x".repeat(400);
+        let g = layout(&long, 180.0, 20.0);
+        assert!(
+            g.rows.len() > 1,
+            "space-less text should wrap to multiple rows, got {}",
+            g.rows.len()
+        );
+        assert!(
+            g.size().x <= 182.0,
+            "galley width {} should not exceed the 180px wrap width",
+            g.size().x
+        );
+    }
+
+    #[test]
+    fn line_height_increases_row_spacing() {
+        // Same two lines, taller line_height → taller galley.
+        let tight = layout("alpha\nbeta", 1000.0, 14.0);
+        let roomy = layout("alpha\nbeta", 1000.0, 28.0);
+        assert!(
+            roomy.size().y > tight.size().y,
+            "a larger line_height should produce a taller galley ({} vs {})",
+            roomy.size().y,
+            tight.size().y
+        );
+    }
+
+    #[test]
+    fn short_text_stays_one_row() {
+        let g = layout("hi", 1000.0, 20.0);
+        assert_eq!(g.rows.len(), 1);
     }
 }
