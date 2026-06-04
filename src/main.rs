@@ -26,6 +26,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
 use bwoc_core::chat_proto::{ChatEvent, ChatInput};
+use bwoc_core::design;
 use bwoc_core::manifest::Manifest;
 use bwoc_core::workspace::AgentsRegistry;
 use eframe::egui;
@@ -33,10 +34,6 @@ use eframe::egui;
 /// Default OpenAI-compatible endpoint (Ollama) when the manifest has no
 /// `baseUrl`. Mirrors the harness's own default.
 const DEFAULT_ENDPOINT: &str = "http://localhost:11434/v1";
-
-/// Line height as a multiple of font size for transcript messages. ~1.4 leaves
-/// room for stacked Thai vowel/tone marks that the default font metrics clip.
-const LINE_HEIGHT_FACTOR: f32 = 1.4;
 
 /// Per-agent accent colours, assigned by index so each agent is visually
 /// distinct in the shared transcript and status bar.
@@ -124,6 +121,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .map_err(|e| format!("eframe: {e}"))?;
     Ok(())
+}
+
+/// Map a design token's RGB half to an egui colour. bwoc-chat is a pixel UI,
+/// so unlike the TUIs (which use the token's ANSI half to respect terminal
+/// themes) it renders the exact token shade.
+fn rgb(t: design::ColorToken) -> egui::Color32 {
+    let (r, g, b) = t.rgb;
+    egui::Color32::from_rgb(r, g, b)
 }
 
 fn palette(i: usize) -> egui::Color32 {
@@ -1203,9 +1208,9 @@ impl eframe::App for ChatApp {
                 ui.strong("bwoc-chat");
                 // Permission mode badge — amber when relaxed past the safe default.
                 let mode_color = if self.mode == "default" {
-                    egui::Color32::GRAY
+                    rgb(design::color::MUTED)
                 } else {
-                    egui::Color32::from_rgb(0xE0, 0xA0, 0x30)
+                    rgb(design::color::WARNING)
                 };
                 ui.label(egui::RichText::new(format!("[{}]", self.mode)).color(mode_color));
                 for s in &self.sessions {
@@ -1293,7 +1298,7 @@ impl eframe::App for ChatApp {
                         };
                         ui.label(
                             egui::RichText::new(who)
-                                .color(egui::Color32::from_rgb(0xE0, 0xA0, 0x30))
+                                .color(rgb(design::color::WARNING))
                                 .strong(),
                         );
                         ui.label(truncate(&p.detail, 120));
@@ -1388,12 +1393,12 @@ impl eframe::App for ChatApp {
                 .show(ui, |ui| {
                     for msg in &self.convo {
                         let (tag, color): (&str, egui::Color32) = match msg.who {
-                            Who::User => ("you", egui::Color32::from_rgb(0x6C, 0xB6, 0xFF)),
+                            Who::User => ("you", rgb(design::color::USER)),
                             Who::Agent => {
                                 let s = &self.sessions[msg.agent];
                                 (short(&s.id), s.color)
                             }
-                            Who::System => ("·", egui::Color32::GRAY),
+                            Who::System => ("·", rgb(design::color::SYSTEM)),
                         };
                         match msg.who {
                             // Assistant replies render as markdown; the tag goes
@@ -1410,7 +1415,7 @@ impl eframe::App for ChatApp {
                             }
                             _ => {
                                 let body = egui::TextStyle::Body.resolve(ui.style());
-                                let line_h = body.size * LINE_HEIGHT_FACTOR;
+                                let line_h = body.size * design::space::LINE_HEIGHT_FACTOR;
                                 let text_color = ui.visuals().text_color();
                                 let job = build_message_job(
                                     tag,
@@ -1424,7 +1429,7 @@ impl eframe::App for ChatApp {
                                 ui.label(job);
                             }
                         }
-                        ui.add_space(8.0);
+                        ui.add_space(design::space::MESSAGE_GAP);
                     }
                 });
         });
