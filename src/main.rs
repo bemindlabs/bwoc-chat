@@ -86,7 +86,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut sessions = Vec::with_capacity(configs.len());
     for (i, cfg) in configs.iter().enumerate() {
         let color = palette(i);
-        sessions.push(AgentSession::spawn(cfg, color)?);
+        let session = if cfg.claude_code {
+            AgentSession::spawn_claude_code(cfg, color)?
+        } else {
+            AgentSession::spawn(cfg, color)?
+        };
+        sessions.push(session);
     }
 
     let title = if sessions.len() == 1 {
@@ -173,6 +178,19 @@ struct AgentConfig {
     backend: String,
     model: String,
     endpoint: String,
+    /// `--claude-code`: drive the `claude` CLI in headless stream-json mode
+    /// (subscription auth, no API key) instead of `bwoc-harness`, translating
+    /// Claude Code's event stream into `chat_proto`.
+    claude_code: bool,
+}
+
+/// Stamp the `--claude-code` flag onto every resolved config (the flag is
+/// session-wide, applied after agent resolution).
+fn with_claude(mut cfgs: Vec<AgentConfig>, on: bool) -> Vec<AgentConfig> {
+    for c in &mut cfgs {
+        c.claude_code = on;
+    }
+    cfgs
 }
 
 /// Resolve CLI args into one or more agents to spawn.
@@ -188,6 +206,7 @@ fn resolve(args: Vec<String>) -> Result<Vec<AgentConfig>, String> {
     let mut endpoint_override: Option<String> = None;
     let mut path_override: Option<PathBuf> = None;
     let mut here = false;
+    let mut claude_code = false;
     let mut it = args.into_iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -196,6 +215,7 @@ fn resolve(args: Vec<String>) -> Result<Vec<AgentConfig>, String> {
             "--endpoint" => endpoint_override = it.next(),
             "--path" => path_override = it.next().map(PathBuf::from),
             "--here" | "." => here = true,
+            "--claude-code" => claude_code = true,
             s if s.starts_with("--") => return Err(format!("unknown flag `{s}`")),
             s => names.push(s.to_string()),
         }
@@ -206,31 +226,40 @@ fn resolve(args: Vec<String>) -> Result<Vec<AgentConfig>, String> {
         if !names.is_empty() {
             return Err("--path takes no agent name (single-agent mode)".into());
         }
-        return Ok(vec![AgentConfig::from_dir(
-            dir,
-            model_override,
-            endpoint_override,
-        )?]);
+        return Ok(with_claude(
+            vec![AgentConfig::from_dir(
+                dir,
+                model_override,
+                endpoint_override,
+            )?],
+            claude_code,
+        ));
     }
     if here {
         if !names.is_empty() {
             return Err("--here / . takes no agent name (single-agent mode)".into());
         }
         let cwd = std::env::current_dir().map_err(|e| format!("cwd: {e}"))?;
-        return Ok(vec![AgentConfig::from_dir(
-            cwd,
-            model_override,
-            endpoint_override,
-        )?]);
+        return Ok(with_claude(
+            vec![AgentConfig::from_dir(
+                cwd,
+                model_override,
+                endpoint_override,
+            )?],
+            claude_code,
+        ));
     }
     // No agent named → the global **personal assistant** at `~/.bwoc/personal`.
     if names.is_empty() {
         let dir = ensure_personal_agent()?;
-        return Ok(vec![AgentConfig::from_dir(
-            dir,
-            model_override,
-            endpoint_override,
-        )?]);
+        return Ok(with_claude(
+            vec![AgentConfig::from_dir(
+                dir,
+                model_override,
+                endpoint_override,
+            )?],
+            claude_code,
+        ));
     }
 
     // ── Workspace mode (one or more named agents from the registry) ──────────
@@ -255,7 +284,7 @@ fn resolve(args: Vec<String>) -> Result<Vec<AgentConfig>, String> {
             endpoint_override.clone(),
         )?);
     }
-    Ok(configs)
+    Ok(with_claude(configs, claude_code))
 }
 
 /// Resolve one named agent from the workspace registry into an [`AgentConfig`].
@@ -306,6 +335,7 @@ fn resolve_workspace_agent(
         backend: entry.backend.clone(),
         model,
         endpoint,
+        claude_code: false,
     })
 }
 
@@ -341,6 +371,7 @@ impl AgentConfig {
             backend: "ollama".to_string(),
             model,
             endpoint,
+            claude_code: false,
         })
     }
 }
@@ -455,6 +486,9 @@ struct AgentSession {
     stdin: ChildStdin,
     rx: Receiver<ChatEvent>,
     child: Child,
+    /// True when the subprocess is the `claude` CLI (stream-json) rather than
+    /// `bwoc-harness` — changes how [`Self::write`] frames stdin input.
+    claude: bool,
 }
 
 impl AgentSession {
@@ -522,14 +556,229 @@ impl AgentSession {
             stdin,
             rx,
             child,
+            claude: false,
+        })
+    }
+
+    /// Spawn the `claude` CLI in headless stream-json mode and translate its
+    /// event stream into `chat_proto` — Claude Code in a native window, using
+    /// the logged-in **subscription** (no `ANTHROPIC_API_KEY`). The reader
+    /// thread maps Claude's `system/init`, `stream_event`, `assistant`,
+    /// `user`, and `result` events into [`ChatEvent`]s the UI already renders.
+    fn spawn_claude_code(cfg: &AgentConfig, color: egui::Color32) -> Result<Self, String> {
+        let claude = resolve_claude();
+        let mut child = Command::new(&claude)
+            .arg("-p")
+            .arg("--input-format")
+            .arg("stream-json")
+            .arg("--output-format")
+            .arg("stream-json")
+            // Live token deltas (content_block_delta) so the window streams.
+            .arg("--include-partial-messages")
+            // stream-json output requires --verbose.
+            .arg("--verbose")
+            // Headless can't prompt interactively; auto-approve edits + common
+            // fs commands. (A richer Allow/Deny bridge is future work.)
+            .arg("--permission-mode")
+            .arg("acceptEdits")
+            .arg("--model")
+            .arg(claude_model_alias(&cfg.model))
+            // Run in the agent dir so Claude Code loads that agent's CLAUDE.md
+            // (→ AGENTS.md) persona automatically.
+            .current_dir(&cfg.agent_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .map_err(|e| {
+                format!(
+                    "failed to spawn claude ({claude}) for {}: {e}",
+                    cfg.agent_id
+                )
+            })?;
+
+        let stdin = child.stdin.take().expect("piped stdin");
+        let stdout = child.stdout.take().expect("piped stdout");
+
+        // Reader thread: claude stream-json lines → ChatEvent → channel.
+        let (tx, rx) = mpsc::channel::<ChatEvent>();
+        let agent_id = cfg.agent_id.clone();
+        std::thread::spawn(move || {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines() {
+                let Ok(line) = line else { break };
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                    continue;
+                };
+                for ev in translate_claude_event(&v, &agent_id) {
+                    if tx.send(ev).is_err() {
+                        return;
+                    }
+                }
+            }
+            let _ = tx.send(ChatEvent::Bye);
+        });
+
+        Ok(AgentSession {
+            status: format!("{} · claude-code · connecting…", cfg.model),
+            id: cfg.agent_id.clone(),
+            color,
+            tools: Vec::new(),
+            activity: Vec::new(),
+            busy: false,
+            alive: true,
+            pending: None,
+            cur: None,
+            stdin,
+            rx,
+            child,
+            claude: true,
         })
     }
 
     fn write(&mut self, input: &ChatInput) {
+        if self.claude {
+            // Claude CLI stream-json input: only user turns are framed; the
+            // other control inputs have no claude-code equivalent in this MVP.
+            if let ChatInput::User { text } = input {
+                let line = serde_json::json!({
+                    "type": "user",
+                    "message": { "role": "user", "content": text },
+                });
+                let _ = writeln!(self.stdin, "{line}");
+                let _ = self.stdin.flush();
+            }
+            return;
+        }
         if let Ok(line) = input.to_line() {
             let _ = writeln!(self.stdin, "{line}");
             let _ = self.stdin.flush();
         }
+    }
+}
+
+/// Resolve the `claude` CLI binary — GUI apps don't inherit a shell `PATH`, so
+/// probe the common install locations before falling back to bare `claude`.
+fn resolve_claude() -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let candidates = [
+        format!("{home}/.local/bin/claude"),
+        "/opt/homebrew/bin/claude".to_string(),
+        "/usr/local/bin/claude".to_string(),
+    ];
+    candidates
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .unwrap_or_else(|| "claude".to_string())
+}
+
+/// Map a manifest model id (e.g. `claude-sonnet-4-6`) to a `claude --model`
+/// alias the CLI reliably accepts. Defaults to `sonnet`.
+fn claude_model_alias(model: &str) -> &'static str {
+    let m = model.to_lowercase();
+    if m.contains("haiku") {
+        "haiku"
+    } else if m.contains("opus") {
+        "opus"
+    } else {
+        "sonnet"
+    }
+}
+
+/// Translate one Claude Code stream-json event into zero or more [`ChatEvent`]s.
+fn translate_claude_event(v: &serde_json::Value, agent_id: &str) -> Vec<ChatEvent> {
+    match v["type"].as_str() {
+        Some("system") if v["subtype"] == "init" => {
+            let model = v["model"].as_str().unwrap_or("claude").to_string();
+            let tools = v["tools"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|t| t.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            vec![ChatEvent::Ready {
+                agent: agent_id.to_string(),
+                model,
+                backend: "claude-code".to_string(),
+                tools,
+            }]
+        }
+        Some("stream_event") => {
+            let ev = &v["event"];
+            if ev["type"] == "content_block_delta" && ev["delta"]["type"] == "text_delta" {
+                let text = ev["delta"]["text"].as_str().unwrap_or_default().to_string();
+                if !text.is_empty() {
+                    return vec![ChatEvent::Token { text }];
+                }
+            }
+            Vec::new()
+        }
+        Some("assistant") => {
+            // Surface tool_use blocks as ToolCall (text is streamed separately
+            // and finalised by the `result` event).
+            let mut out = Vec::new();
+            if let Some(blocks) = v["message"]["content"].as_array() {
+                for b in blocks {
+                    if b["type"] == "tool_use" {
+                        out.push(ChatEvent::ToolCall {
+                            id: b["id"].as_str().unwrap_or_default().to_string(),
+                            name: b["name"].as_str().unwrap_or_default().to_string(),
+                            args: b["input"].to_string(),
+                        });
+                    }
+                }
+            }
+            out
+        }
+        Some("user") => {
+            // Claude's own tool results arrive as user tool_result blocks.
+            let mut out = Vec::new();
+            if let Some(blocks) = v["message"]["content"].as_array() {
+                for b in blocks {
+                    if b["type"] == "tool_result" {
+                        let output = b["content"]
+                            .as_str()
+                            .map(String::from)
+                            .unwrap_or_else(|| b["content"].to_string());
+                        out.push(ChatEvent::ToolResult {
+                            id: b["tool_use_id"].as_str().unwrap_or_default().to_string(),
+                            name: "tool".to_string(),
+                            ok: !b["is_error"].as_bool().unwrap_or(false),
+                            output,
+                        });
+                    }
+                }
+            }
+            out
+        }
+        Some("result") => {
+            let u = &v["usage"];
+            let prompt = u["input_tokens"].as_u64().unwrap_or(0);
+            let completion = u["output_tokens"].as_u64().unwrap_or(0);
+            let mut out = Vec::new();
+            if v["is_error"].as_bool().unwrap_or(false) {
+                out.push(ChatEvent::Error {
+                    message: v["result"].as_str().unwrap_or("claude error").to_string(),
+                });
+            } else if let Some(text) = v["result"].as_str() {
+                // Final assistant text — overwrites the streamed buffer (same content).
+                out.push(ChatEvent::Message {
+                    text: text.to_string(),
+                });
+            }
+            out.push(ChatEvent::TurnEnd {
+                prompt_tokens: prompt,
+                completion_tokens: completion,
+            });
+            out
+        }
+        _ => Vec::new(),
     }
 }
 
@@ -1227,6 +1476,87 @@ fn truncate(s: &str, max: usize) -> String {
         let mut t: String = one_line.chars().take(max).collect();
         t.push('…');
         t
+    }
+}
+
+#[cfg(test)]
+mod claude_code_tests {
+    use super::*;
+    use bwoc_core::chat_proto::ChatEvent;
+    use serde_json::json;
+
+    #[test]
+    fn init_becomes_ready_with_claude_code_backend() {
+        let v = json!({"type":"system","subtype":"init","model":"claude-sonnet-4-5","tools":["Read","Bash"]});
+        let out = translate_claude_event(&v, "agent-x");
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            ChatEvent::Ready {
+                agent,
+                model,
+                backend,
+                tools,
+            } => {
+                assert_eq!(agent, "agent-x");
+                assert_eq!(model, "claude-sonnet-4-5");
+                assert_eq!(backend, "claude-code");
+                assert_eq!(tools, &vec!["Read".to_string(), "Bash".to_string()]);
+            }
+            other => panic!("expected Ready, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn partial_text_delta_becomes_token() {
+        let v = json!({"type":"stream_event","event":{"type":"content_block_delta",
+            "delta":{"type":"text_delta","text":"Hi"}}});
+        let out = translate_claude_event(&v, "a");
+        assert_eq!(out, vec![ChatEvent::Token { text: "Hi".into() }]);
+    }
+
+    #[test]
+    fn result_emits_message_then_turn_end_with_usage() {
+        let v = json!({"type":"result","subtype":"success","is_error":false,
+            "result":"done","usage":{"input_tokens":12,"output_tokens":3}});
+        let out = translate_claude_event(&v, "a");
+        assert_eq!(out.len(), 2);
+        assert_eq!(
+            out[0],
+            ChatEvent::Message {
+                text: "done".into()
+            }
+        );
+        assert_eq!(
+            out[1],
+            ChatEvent::TurnEnd {
+                prompt_tokens: 12,
+                completion_tokens: 3
+            }
+        );
+    }
+
+    #[test]
+    fn assistant_tool_use_becomes_tool_call() {
+        let v = json!({"type":"assistant","message":{"content":[
+            {"type":"text","text":"working"},
+            {"type":"tool_use","id":"tu1","name":"Read","input":{"path":"x"}}]}});
+        let out = translate_claude_event(&v, "a");
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            ChatEvent::ToolCall { id, name, .. } => {
+                assert_eq!(id, "tu1");
+                assert_eq!(name, "Read");
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_result_becomes_error_event() {
+        let v = json!({"type":"result","is_error":true,"result":"Not logged in",
+            "usage":{"input_tokens":0,"output_tokens":0}});
+        let out = translate_claude_event(&v, "a");
+        assert!(matches!(&out[0], ChatEvent::Error { message } if message == "Not logged in"));
     }
 }
 
