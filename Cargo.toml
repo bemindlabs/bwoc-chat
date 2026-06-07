@@ -12,7 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Single source of truth for the chat protocol + manifest/agent resolution.
-bwoc-core = { path = "../bwoc-framwork/crates/bwoc-core" }
+bwoc-core = { path = "../bwoc-framework/crates/bwoc-core" }
 eframe = "0.29"
 egui_commonmark = "0.18"
 serde_json = "1"

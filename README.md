@@ -20,7 +20,7 @@ streaming replies, live tool activity, and inline permission prompts.
 
 `bwoc-chat` is a thin **renderer** over the protocol the framework already speaks.
 It spawns `bwoc-harness --chat` for an agent and draws the
-[`bwoc_core::chat_proto`](../bwoc-framwork/crates/bwoc-core/src/chat_proto.rs)
+[`bwoc_core::chat_proto`](../bwoc-framework/crates/bwoc-core/src/chat_proto.rs)
 event stream — the same wire format the in-terminal `bwoc chat --tui` uses.
 
 > The **harness** owns each session, its tools, model calls, and the
@@ -107,7 +107,7 @@ A reader `std::thread` parses the child's stdout lines into `ChatEvent`s onto an
 ## 🏗️ Why a separate project
 
 Keeps the heavy GUI dep tree (winit / glow) out of the lean
-[`bwoc-framwork`](../bwoc-framwork) workspace. `bwoc-chat` depends **only** on
+[`bwoc-framework`](../bwoc-framework) workspace. `bwoc-chat` depends **only** on
 `bwoc-core` (by path) for the protocol + agent resolution — never on `bwoc-cli`
 or `bwoc-harness`. The harness is a runtime subprocess, not a build dependency.
 
