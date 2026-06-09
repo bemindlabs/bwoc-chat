@@ -142,6 +142,23 @@ fn short(id: &str) -> &str {
     id.strip_prefix("agent-").unwrap_or(id)
 }
 
+/// Best-effort forward of a spoken-worthy turn to the `bwoc-speaker` daemon.
+/// Writes one `{"agent","text"}` JSON line to `~/.bwoc/speaker.sock`; if the
+/// daemon isn't running we silently no-op (speech is optional, never blocks
+/// chat). Connection + write are quick and synchronous on the UI thread.
+fn speak_forward(agent: &str, text: &str) {
+    use std::os::unix::net::UnixStream;
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let sock = PathBuf::from(home).join(".bwoc/speaker.sock");
+    let line = serde_json::json!({ "agent": agent, "text": text }).to_string();
+    if let Ok(mut stream) = UnixStream::connect(&sock) {
+        let _ = stream.write_all(line.as_bytes());
+        let _ = stream.write_all(b"\n");
+    }
+}
+
 /// Install a Thai/Unicode-capable fallback font so non-Latin text (e.g. Thai)
 /// renders instead of tofu boxes — egui's built-in fonts are Latin-centric. We
 /// append a broad system font as a per-glyph fallback (egui falls through the
@@ -649,7 +666,7 @@ impl AgentSession {
         if self.claude {
             // Claude CLI stream-json input: only user turns are framed; the
             // other control inputs have no claude-code equivalent in this MVP.
-            if let ChatInput::User { text } = input {
+            if let ChatInput::User { text, .. } = input {
                 let line = serde_json::json!({
                     "type": "user",
                     "message": { "role": "user", "content": text },
@@ -826,6 +843,9 @@ struct ChatApp {
     cwd: PathBuf,
     /// Render cache for the CommonMark (markdown) viewer.
     md_cache: egui_commonmark::CommonMarkCache,
+    /// When on, each completed assistant message is forwarded to the
+    /// `bwoc-speaker` daemon socket to be spoken in that agent's voice.
+    speak: bool,
 }
 
 impl ChatApp {
@@ -853,6 +873,7 @@ impl ChatApp {
             mode: "default".to_string(),
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             md_cache: egui_commonmark::CommonMarkCache::default(),
+            speak: std::env::var_os("BWOC_CHAT_SPEAK").is_some(),
             sessions,
         }
     }
@@ -909,6 +930,10 @@ impl ChatApp {
                 }
             }
             ChatEvent::Message { text } => {
+                // Speak the completed turn in this agent's voice (best-effort).
+                if self.speak {
+                    speak_forward(&self.sessions[idx].id, &text);
+                }
                 // Final assistant text — overwrite the streamed buffer if any.
                 match self.sessions[idx].cur {
                     Some(ci) => self.convo[ci].text = text,
@@ -988,6 +1013,14 @@ impl ChatApp {
                     text: format!("{id} session ended."),
                 });
             }
+            ChatEvent::TeamMessage { from, text, .. } => {
+                // A teammate's message surfaced from the shared team channel.
+                self.convo.push(Msg {
+                    who: Who::System,
+                    agent: idx,
+                    text: format!("@{} · {text}", short(&from)),
+                });
+            }
         }
     }
 
@@ -1027,7 +1060,11 @@ impl ChatApp {
             }
             self.sessions[i].busy = true;
             self.sessions[i].cur = None;
-            self.sessions[i].write(&ChatInput::User { text: body.clone() });
+            self.sessions[i].write(&ChatInput::User {
+                text: body.clone(),
+                // Trusted local GUI frontend — same ingress label as the TUI.
+                principal: bwoc_core::trust::Principal::LocalOperator,
+            });
         }
     }
 
@@ -1213,6 +1250,8 @@ impl eframe::App for ChatApp {
                     rgb(design::color::WARNING)
                 };
                 ui.label(egui::RichText::new(format!("[{}]", self.mode)).color(mode_color));
+                // 🔊 forward completed turns to the bwoc-speaker daemon.
+                ui.checkbox(&mut self.speak, "🔊 speak");
                 for s in &self.sessions {
                     ui.separator();
                     ui.label(egui::RichText::new(short(&s.id)).color(s.color).strong());
