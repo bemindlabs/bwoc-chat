@@ -7,7 +7,7 @@
 [![Rust](https://img.shields.io/badge/rust-2024-orange.svg?logo=rust)](https://www.rust-lang.org)
 [![UI: egui](https://img.shields.io/badge/ui-egui-blue.svg)](https://github.com/emilk/egui)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](#license)
-[![Backends](https://img.shields.io/badge/backends-ollama%20%C2%B7%20openai--compatible-555.svg)](#-requirements)
+[![Backends](https://img.shields.io/badge/backends-ollama%20%C2%B7%20openai--compatible%20%C2%B7%20claude-555.svg)](#-requirements)
 
 A tiny [egui](https://github.com/emilk/egui) window that talks to a BWOC agent —
 streaming replies, live tool activity, and inline permission prompts.
@@ -101,8 +101,9 @@ A reader `std::thread` parses the child's stdout lines into `ChatEvent`s onto an
 - `bwoc-harness` on `PATH` (or installed beside the running binary — it's
   resolved as a sibling of the current executable).
 - A reachable model endpoint for a **harness backend** (`ollama` /
-  `openai-compatible`) — e.g. `ollama serve`. Vendor-CLI backends (claude /
-  codex / kimi / agy) aren't rendered here; use `bwoc spawn` for those.
+  `openai-compatible`) — or the native `claude`/`anthropic` provider. Other
+  vendor-CLI backends (codex / kimi / agy) aren't rendered here; use `bwoc spawn`
+  for those.
 
 ## 🏗️ Why a separate project
 
