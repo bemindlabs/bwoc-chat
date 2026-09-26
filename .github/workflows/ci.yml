@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # Nightly: bwoc-chat builds against the framework's `main` (bwoc-core is a
+  # path dependency), so a chat_proto change there breaks this build even when
+  # nothing changes here.
+  schedule:
+    - cron: "41 3 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: fmt + clippy + test (against BWOC-Framework main)
+    runs-on: ubuntu-latest
+    steps:
+      # Cargo.toml points at ../bwoc-framework/crates/bwoc-core: check both
+      # repos out side by side.
+      - uses: actions/checkout@v5
+        with:
+          path: bwoc-chat
+      - uses: actions/checkout@v5
+        with:
+          repository: bemindlabs/BWOC-Framework
+          path: bwoc-framework
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: bwoc-chat
+      - name: fmt
+        working-directory: bwoc-chat
+        run: cargo fmt --check
+      - name: clippy
+        working-directory: bwoc-chat
+        run: cargo clippy --all-targets -- -D warnings
+      - name: test
+        working-directory: bwoc-chat
+        run: cargo test
