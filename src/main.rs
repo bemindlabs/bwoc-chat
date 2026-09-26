@@ -1032,9 +1032,15 @@ impl ChatApp {
                     text: format!("⚠ this reply is from `{served}`, not `{requested}`"),
                 });
             }
-            // Display-only events this window does not render yet (thinking,
-            // diffs, model/describe/undo acknowledgements, cancel).
-            _ => {}
+            // Display-only events this window does not render yet. Listed, not
+            // `_`: a new ChatEvent variant must fail this build (nightly CI
+            // against the framework) so someone decides how to show it.
+            ChatEvent::Thinking { .. }
+            | ChatEvent::Diff { .. }
+            | ChatEvent::ModelChanged { .. }
+            | ChatEvent::Described { .. }
+            | ChatEvent::Reverted { .. }
+            | ChatEvent::Cancelled => {}
         }
     }
 
