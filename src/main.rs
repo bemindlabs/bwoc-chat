@@ -797,6 +797,8 @@ fn translate_claude_event(v: &serde_json::Value, agent_id: &str) -> Vec<ChatEven
             out.push(ChatEvent::TurnEnd {
                 prompt_tokens: prompt,
                 completion_tokens: completion,
+                // Not carried over from the CLI's own accounting.
+                cost_usd: None,
             });
             out
         }
@@ -986,6 +988,7 @@ impl ChatApp {
             ChatEvent::TurnEnd {
                 prompt_tokens,
                 completion_tokens,
+                ..
             } => {
                 let s = &mut self.sessions[idx];
                 s.busy = false;
@@ -1021,6 +1024,17 @@ impl ChatApp {
                     text: format!("@{} · {text}", short(&from)),
                 });
             }
+            ChatEvent::ModelFallback { requested, served } => {
+                // The endpoint answered from another model without an error.
+                self.convo.push(Msg {
+                    who: Who::System,
+                    agent: idx,
+                    text: format!("⚠ this reply is from `{served}`, not `{requested}`"),
+                });
+            }
+            // Display-only events this window does not render yet (thinking,
+            // diffs, model/describe/undo acknowledgements, cancel).
+            _ => {}
         }
     }
 
@@ -1574,7 +1588,8 @@ mod claude_code_tests {
             out[1],
             ChatEvent::TurnEnd {
                 prompt_tokens: 12,
-                completion_tokens: 3
+                completion_tokens: 3,
+                cost_usd: None
             }
         );
     }
