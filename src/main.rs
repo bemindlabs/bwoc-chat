@@ -143,9 +143,11 @@ fn short(id: &str) -> &str {
 }
 
 /// Best-effort forward of a spoken-worthy turn to the `bwoc-speaker` daemon.
-/// Writes one `{"agent","text"}` JSON line to `~/.bwoc/speaker.sock`; if the
-/// daemon isn't running we silently no-op (speech is optional, never blocks
-/// chat). Connection + write are quick and synchronous on the UI thread.
+/// Writes one `{"agent": "<id>", "text": "<turn>"}` JSON line to
+/// `~/.bwoc/speaker.sock`; if the daemon isn't running we silently no-op
+/// (speech is optional, never blocks chat). Connection + write are quick and
+/// synchronous on the UI thread.
+#[cfg(unix)]
 fn speak_forward(agent: &str, text: &str) {
     use std::os::unix::net::UnixStream;
     let Some(home) = std::env::var_os("HOME") else {
@@ -158,6 +160,11 @@ fn speak_forward(agent: &str, text: &str) {
         let _ = stream.write_all(b"\n");
     }
 }
+
+/// The speaker daemon listens on a Unix socket; elsewhere speech is a no-op so
+/// chat still builds and runs.
+#[cfg(not(unix))]
+fn speak_forward(_agent: &str, _text: &str) {}
 
 /// Install a Thai/Unicode-capable fallback font so non-Latin text (e.g. Thai)
 /// renders instead of tofu boxes — egui's built-in fonts are Latin-centric. We
